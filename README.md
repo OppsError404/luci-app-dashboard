@@ -9,7 +9,7 @@ Real-time system monitoring dashboard and vnStat database backup manager for Ope
 ### For OpenWrt v25.12 or newer (.apk)
 
 ```bash
-wget --no-check-certificate -O /tmp/luci-app-dashboard.apk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v1.0.0/luci-app-dashboard-1.0.0-r1.apk" && \
+wget --no-check-certificate -O /tmp/luci-app-dashboard.apk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v1.0.0-r2/luci-app-dashboard-1.0.0-r2.apk" && \
 apk add --allow-untrusted /tmp/luci-app-dashboard.apk && \
 rm -f /tmp/luci-app-dashboard.apk
 ```
@@ -17,7 +17,7 @@ rm -f /tmp/luci-app-dashboard.apk
 ### For OpenWrt v24.10.5 or older (.ipk)
 
 ```bash
-wget --no-check-certificate -O /tmp/luci-app-dashboard.ipk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v1.0.0/luci-app-dashboard_1.0.0-r1.ipk" && \
+wget --no-check-certificate -O /tmp/luci-app-dashboard.ipk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v1.0.0-r2/luci-app-dashboard_1.0.0-r2.ipk" && \
 opkg install /tmp/luci-app-dashboard.ipk && \
 rm -f /tmp/luci-app-dashboard.ipk
 ```
@@ -120,6 +120,7 @@ Apply changes:
 | `lua` | Yes | Lua runtime |
 | `luci-compat` | Yes | Compatibility layer |
 | `curl` | Yes | HTTP client for IP/ISP lookups |
+| `luci-lib-nixio` | Yes | Nixio library for filesystem operations |
 
 ### Optional
 
