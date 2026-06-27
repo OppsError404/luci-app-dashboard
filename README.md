@@ -9,7 +9,7 @@ Real-time system monitoring dashboard and vnStat database backup manager for Ope
 ### For OpenWrt v25.12 or newer (.apk)
 
 ```bash
-wget --no-check-certificate -O /tmp/luci-app-dashboard.apk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v1.0.0-r5/luci-app-dashboard-1.0.0-r5.apk" && \
+wget --no-check-certificate -O /tmp/luci-app-dashboard.apk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v1.0.0-r6/luci-app-dashboard-1.0.0-r6.apk" && \
 apk add --allow-untrusted /tmp/luci-app-dashboard.apk && \
 rm -f /tmp/luci-app-dashboard.apk
 ```
@@ -17,7 +17,7 @@ rm -f /tmp/luci-app-dashboard.apk
 ### For OpenWrt v24.10.5 or older (.ipk)
 
 ```bash
-wget --no-check-certificate -O /tmp/luci-app-dashboard.ipk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v1.0.0-r5/luci-app-dashboard_1.0.0-r5.ipk" && \
+wget --no-check-certificate -O /tmp/luci-app-dashboard.ipk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v1.0.0-r6/luci-app-dashboard_1.0.0-r6.ipk" && \
 opkg install /tmp/luci-app-dashboard.ipk && \
 rm -f /tmp/luci-app-dashboard.ipk
 ```
@@ -100,6 +100,7 @@ config dashboard 'settings'
     option vnstat   '1'     # Show vnStat traffic card (0/1)
     option adblock  '1'     # Show Adblock status card (0/1)
     option vnstat_db '0'    # Enable automatic vnStat DB backups (0/1)
+    option multi_core '1'   # Manaually enable/disable per core graph (0/1)
 ```
 
 Apply changes:
