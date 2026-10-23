@@ -74,8 +74,6 @@ Navigate to **Dashboard** in the LuCI menu.
 /etc/init.d/dashboard status                  # Show full service status
 /etc/init.d/dashboard vnstat_enable           # Enable vnStat card
 /etc/init.d/dashboard vnstat_disable          # Disable vnStat card
-/etc/init.d/dashboard adblock_enable          # Enable Adblock card
-/etc/init.d/dashboard adblock_disable         # Disable Adblock card
 /etc/init.d/dashboard vnstat_backup_enable    # Enable scheduled 12h DB backup
 /etc/init.d/dashboard vnstat_backup_disable   # Final backup then disable
 /etc/init.d/dashboard vnstat_backup_fix       # Repair missing cron job
@@ -99,7 +97,6 @@ Edit `/etc/config/dashboard`:
 ```
 config dashboard 'settings'
     option vnstat   '1'     # Show vnStat traffic card (0/1)
-    option adblock  '1'     # Show Adblock status card (0/1)
     option vnstat_db '0'    # Enable automatic vnStat DB backups (0/1)
     option multi_core '1'   # Manaually enable/disable per core graph (0/1)
 ```
