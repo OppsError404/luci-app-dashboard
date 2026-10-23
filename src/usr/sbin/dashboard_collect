@@ -1,0 +1,198 @@
+#!/usr/bin/lua
+-- dashboard_collect, collects the metrics for the dashboard
+-- the rpcd script starts it when somebody opens the page, it collects
+-- everything every 2s and writes it to /tmp/dashboard/data.json
+-- it stops by itself after a while if nobody is looking at the page
+
+math.randomseed(math.floor(os.time() + os.clock() * 1000))
+
+local collector = require "luci.dashboard_pkg.collector"
+
+local nixio_ok, nixio = pcall(require, "nixio")
+local nixio_fs = nixio_ok and nixio.fs or nil
+local has_jsonc, jsonc = pcall(require, "luci.jsonc")
+
+-- luci.util.perror needs luci-compat, so we write to stderr ourselves
+local function perror(msg)
+  io.stderr:write(tostring(msg) .. "\n")
+end
+
+-- config
+local DATA_FILE       = "/tmp/dashboard/data.json"
+local HEARTBEAT_FILE  = "/tmp/dashboard/heartbeat"
+local PID_FILE        = "/tmp/dashboard/daemon.pid"
+local FORCE_FILE       = "/tmp/dashboard/.force_refresh"
+local IDLE_TIMEOUT    = 60      -- stop after 60s without a client
+local COLLECT_INTERVAL = 2       -- collect every 2s
+local IDLE_CHECK_INTERVAL = 10   -- check the heartbeat every 10s when idle
+
+-- helpers
+local function log(msg)
+  perror("dashboard_collect: " .. msg)
+end
+
+local function get_pid()
+  if nixio_ok and nixio.getpid then
+    return nixio.getpid()
+  end
+  local link = nixio_fs and nixio_fs.readlink and nixio_fs.readlink("/proc/self")
+  if link then
+    return tonumber(link:match("(%d+)")) or 0
+  end
+  return 0
+end
+
+local function write_pid()
+  local pid = get_pid()
+  if pid == 0 then
+    log("WARNING: could not determine PID")
+    return
+  end
+  local f = io.open(PID_FILE, "w")
+  if f then f:write(tostring(pid)); f:close() end
+end
+
+local function remove_pid()
+  os.remove(PID_FILE)
+end
+
+local function read_heartbeat()
+  local f = io.open(HEARTBEAT_FILE, "r")
+  if not f then return 0 end
+  local ts = tonumber(f:read("*a")) or 0
+  f:close()
+  return ts
+end
+
+local function file_exists(path)
+  local f = io.open(path, "r")
+  if not f then return false end
+  f:close()
+  return true
+end
+
+local function atomic_write(path, content)
+  local tmp = path .. ".tmp." .. tostring(os.time()) .. "." .. tostring(math.random(100000, 999999)) .. "." .. tostring(os.clock() * 1000 % 1000000)
+  local f = io.open(tmp, "w")
+  if not f then return false end
+  f:write(content)
+  f:close()
+  if not os.rename(tmp, path) then
+    os.remove(tmp)
+    return false
+  end
+  return true
+end
+
+local function sleep(seconds)
+  if nixio_ok then
+    local sec = math.floor(seconds)
+    local nsec = math.floor((seconds - sec) * 1e9)
+    nixio.nanosleep(sec, nsec)
+  end
+end
+
+-- main loop
+
+-- make sure the folder is there
+if nixio_fs and nixio_fs.mkdir then
+  nixio_fs.mkdir("/tmp/dashboard")
+else
+  os.execute("mkdir -p /tmp/dashboard")
+end
+
+-- save the pid
+write_pid()
+log("daemon started (pid file: " .. PID_FILE .. ")")
+
+-- open the ubus connection
+if not collector.init() then
+  log("FATAL: cannot connect to ubus — writing error and exiting")
+  atomic_write(DATA_FILE, '{"error":"ubus daemon unavailable"}')
+  remove_pid()
+  os.exit(1)
+end
+
+-- first round without the slow stuff (ping, isp lookup, vnstat) so the
+-- file is there in about a second and the browser gets the cpu and wan
+-- numbers right away. the slow ones come in the first full round.
+local ok, data = pcall(collector.collect, true)
+if ok and data then
+  local json = has_jsonc and jsonc.stringify(data) or "{}"
+  atomic_write(DATA_FILE, json)
+  log("initial fast collection complete")
+else
+  log("WARNING: initial collection failed: " .. tostring(data))
+  atomic_write(DATA_FILE, '{"error":"initial collection failed"}')
+end
+
+-- one more fast round to get a second sample, the browser needs two
+-- samples to work out the cpu and wan speed. sleep a bit first so the
+-- counters actually move.
+sleep(1)
+ok, data = pcall(collector.collect, true)
+if ok and data then
+  local json = has_jsonc and jsonc.stringify(data) or "{}"
+  atomic_write(DATA_FILE, json)
+end
+
+local fast_polls = 0       -- how many 1s rounds are left
+local prev_idle = 999      -- the idle value from the last round
+
+while true do
+  local now = os.time()
+  local last_poll = read_heartbeat()
+  local idle = now - last_poll
+
+  -- nobody is looking at the page, stop
+  if last_poll > 0 and idle > IDLE_TIMEOUT then
+    log("idle timeout (" .. idle .. "s > " .. IDLE_TIMEOUT .. "s) — exiting")
+    break
+  end
+
+  -- a new browser started polling, do a few quick rounds so the
+  -- cpu and wan numbers show up fast
+  if last_poll > 0 and idle <= 2 and prev_idle > 10 then
+    fast_polls = 5
+  end
+  prev_idle = idle
+
+  -- the controller may ask us to drop the cache
+  if file_exists(FORCE_FILE) then
+    os.remove(FORCE_FILE)
+    collector.clear_cache()
+    log("cache cleared (force refresh)")
+  end
+
+  -- get the numbers
+  ok, data = pcall(collector.collect)
+  if ok and data then
+    local json = has_jsonc and jsonc.stringify(data) or "{}"
+    atomic_write(DATA_FILE, json)
+  else
+    log("ERROR: collection failed: " .. tostring(data))
+  end
+
+  -- sleep a bit, after a new client connects we go faster for a
+  -- while and then back to the normal speed
+  if last_poll > 0 and idle > 10 then
+    -- nothing happening but we are still under the timeout, so look at
+    -- the heartbeat every second. if it moved we break out and the main
+    -- loop can see the new client.
+    for _ = 1, IDLE_CHECK_INTERVAL do
+      sleep(1)
+      if os.time() - read_heartbeat() <= 2 then break end
+    end
+  elseif fast_polls > 0 then
+    sleep(1)
+    fast_polls = fast_polls - 1
+  else
+    -- somebody is watching, collect at the normal speed
+    sleep(COLLECT_INTERVAL)
+  end
+end
+
+-- clean up
+collector.close()
+remove_pid()
+log("daemon stopped")

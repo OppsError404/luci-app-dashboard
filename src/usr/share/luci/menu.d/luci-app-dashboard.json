@@ -1,0 +1,1 @@
+{"admin/dashboard": {"title": "Dashboard", "order": 1, "action": {"type": "template", "path": "dashboard/dashboard"}, "depends": {"acl": ["luci-app-dashboard"]}}, "admin/status/vnstat2/backup": {"title": "Backup", "order": 3, "action": {"type": "template", "path": "dashboard/vnstat_backup"}, "depends": {"acl": ["luci-app-dashboard"], "fs": {"/usr/bin/vnstat": "executable"}}}}

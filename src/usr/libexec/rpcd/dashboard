@@ -1,0 +1,580 @@
+#!/bin/sh
+# /usr/libexec/rpcd/dashboard
+# ubus backend for luci-app-dashboard
+# gives the "dashboard" ubus object with the data, settings, update check
+# and vnstat backup/restore methods
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+DATA_FILE="/tmp/dashboard/data.json"
+HEARTBEAT_FILE="/tmp/dashboard/heartbeat"
+PID_FILE="/tmp/dashboard/daemon.pid"
+FORCE_FILE="/tmp/dashboard/.force_refresh"
+DAEMON_CMD="/usr/sbin/dashboard_collect"
+BACKUP_FILE="/etc/vnstat/backup/vnstat.db.gz"
+DB_SRC="/tmp/lib/vnstat/vnstat.db"
+STAGED_FILE="/tmp/dashboard/vnstat_upload.gz"
+GITHUB_API_URL="https://api.github.com/repos/OppsError404/luci-app-dashboard/releases/latest"
+
+log() { logger -t "rpcd-dashboard" "$*"; }
+
+# check that the pid in $PID_FILE is a running dashboard_collect
+# also removes the pid file if the process is gone
+_daemon_alive() {
+	local pid
+	[ -f "$PID_FILE" ] || return 1
+	read -r pid < "$PID_FILE" 2>/dev/null
+	[ -n "$pid" ] && [ "$pid" != "0" ] || { rm -f "$PID_FILE"; return 1; }
+	kill -0 "$pid" 2>/dev/null || { rm -f "$PID_FILE"; return 1; }
+	# the pid could be used by something else now, so check the name too
+	grep -q "dashboard_collect" /proc/"$pid"/cmdline 2>/dev/null && return 0
+	rm -f "$PID_FILE"
+	return 1
+}
+
+# make sure the collector daemon runs, does not wait for it
+_ensure_daemon() {
+	mkdir -p /tmp/dashboard 2>/dev/null
+	date +%s > "$HEARTBEAT_FILE"
+
+	_daemon_alive && return 0
+
+	flock -n /tmp/dashboard/.daemon.lock lua "$DAEMON_CMD" >/dev/null 2>&1 &
+}
+
+# get_data
+# returns what the daemon collected, starts it if it is not running
+get_data() {
+	_ensure_daemon
+
+	# check how old the file is, the daemon can be alive but sleeping and
+	# then the numbers are old. the frontend needs two different samples
+	# to work out the cpu and wan speed.
+	local now file_mtime age
+	now=$(date +%s)
+
+	if [ -f "$DATA_FILE" ]; then
+		file_mtime=$(date -r "$DATA_FILE" +%s 2>/dev/null || echo "$now")
+		age=$((now - file_mtime))
+		if [ "$age" -le 5 ]; then
+			local data
+			read -r data < "$DATA_FILE" 2>/dev/null
+			if [ -n "$data" ]; then
+				printf '%s' "$data"
+				return 0
+			fi
+		fi
+	fi
+
+	json_init
+	json_add_string "error" "collecting"
+	json_add_int "retry_ms" 500
+	json_dump
+}
+
+# force_refresh
+force_refresh() {
+	mkdir -p /tmp/dashboard
+	printf '1' > "$FORCE_FILE"
+	date +%s > "$HEARTBEAT_FILE"
+
+	json_init
+	json_add_boolean "ok" 1
+	json_add_string "message" "cache cleared"
+	json_dump
+}
+
+# get_settings
+get_settings() {
+	local vnstat vnstat_db multi_core
+	vnstat=$(uci -q get dashboard.settings.vnstat 2>/dev/null)
+	vnstat_db=$(uci -q get dashboard.settings.vnstat_db 2>/dev/null)
+	multi_core=$(uci -q get dashboard.settings.multi_core 2>/dev/null)
+
+	# is the cron job there
+	local cron_active=0 cron_interval="every 12h"
+	if grep -qF "dashboard_vnstat_db_backup" /etc/crontabs/root 2>/dev/null; then
+		cron_active=1
+	fi
+
+	json_init
+	json_add_string "vnstat" "${vnstat:-1}"
+	json_add_string "vnstat_db" "${vnstat_db:-0}"
+	json_add_string "multi_core" "${multi_core:-1}"
+	json_add_boolean "vnstat_db_active" "$cron_active"
+	json_add_string "vnstat_db_interval" "$cron_interval"
+	json_dump
+}
+
+# set_settings
+# takes key and val as strings
+set_settings() {
+	local key val
+	json_load "$1"
+	json_get_var key key
+	json_get_var val val
+	json_cleanup
+
+	case "$key" in
+		vnstat)
+			case "$val" in 0|1) ;; *) key="";; esac
+			;;
+		vnstat_db)
+			if [ "$val" = "1" ]; then
+				/etc/init.d/dashboard vnstat_backup_enable 2>/dev/null
+			else
+				/etc/init.d/dashboard vnstat_backup_disable 2>/dev/null
+			fi
+			json_init
+			json_add_boolean "ok" 1
+			json_add_string "key" "$key"
+			json_add_string "val" "$val"
+			json_dump
+			return 0
+			;;
+		*)
+			key=""
+			;;
+	esac
+
+	if [ -z "$key" ]; then
+		json_init
+		json_add_boolean "ok" 0
+		json_add_string "error" "invalid params"
+		json_dump
+		return 0
+	fi
+
+	uci set "dashboard.settings.$key=$val"
+	uci commit dashboard
+
+	# tell the daemon to drop the cache
+	mkdir -p /tmp/dashboard
+	case "$key" in
+		vnstat) printf '1' > "$FORCE_FILE" ;;
+	esac
+
+	json_init
+	json_add_boolean "ok" 1
+	json_add_string "key" "$key"
+	json_add_string "val" "$val"
+	json_dump
+}
+
+# fix_cron
+fix_cron() {
+	local ret
+	/etc/init.d/dashboard vnstat_backup_fix 2>/dev/null
+	ret=$?
+
+	json_init
+	if [ "$ret" = "0" ]; then
+		json_add_boolean "ok" 1
+		json_add_string "message" "Cron job added (if missing)"
+	else
+		json_add_boolean "ok" 0
+		json_add_string "error" "Failed to add cron job"
+	fi
+	json_dump
+}
+
+# runs in the background, does the github fetch and writes the cache files.
+# never call this from the rpcd dispatch, it would block rpcd
+_do_update_check() {
+	local current_version="$1"
+	local now ts_file dat_file lock_file
+	now=$(date +%s)
+	ts_file="/tmp/dashboard/update_check_ts"
+	dat_file="/tmp/dashboard/update_check.json"
+	lock_file="/tmp/dashboard/update_check.lock"
+
+	# get the latest release from github, uclient-fetch is already on the
+	# router so no need for curl
+	local api_result latest_version="" download_url="" release_url="" release_body="" error_msg=""
+	api_result=$(uclient-fetch -q -T 30 -O- --no-check-certificate "$GITHUB_API_URL" 2>/dev/null)
+
+	if [ -n "$api_result" ]; then
+		latest_version=$(echo "$api_result" | jsonfilter -e '@.tag_name' 2>/dev/null)
+		if [ -n "$latest_version" ]; then
+			latest_version=$(echo "$latest_version" | sed 's/^v//')
+		fi
+		release_url=$(echo "$api_result" | jsonfilter -e '@.html_url' 2>/dev/null)
+		release_body=$(echo "$api_result" | jsonfilter -e '@.body' 2>/dev/null)
+
+		# look for the download url with the package type we want
+		local preferred_ext="ipk"
+		if [ -f /lib/apk/db/installed ]; then
+			preferred_ext="apk"
+		fi
+
+		local assets_count i
+		assets_count=$(echo "$api_result" | jsonfilter -e '@.assets[*].name' 2>/dev/null | wc -l)
+		i=0
+		while [ "$i" -lt "$assets_count" ]; do
+			local name url
+			name=$(echo "$api_result" | jsonfilter -e "@.assets[$i].name" 2>/dev/null)
+			url=$(echo "$api_result" | jsonfilter -e "@.assets[$i].browser_download_url" 2>/dev/null)
+			if [ -n "$name" ]; then
+				local ext
+				ext=$(echo "$name" | sed 's/.*\.//')
+				if [ "$ext" = "$preferred_ext" ] && ! echo "$name" | grep -q "i18n"; then
+					download_url="$url"
+					break
+				fi
+			fi
+			i=$((i + 1))
+		done
+	else
+		error_msg="Failed to fetch release info"
+	fi
+
+	# compare the versions, the -rN part is optional (2.0.0-r1)
+	# format is MAJOR.MINOR.PATCH-rN, anything missing counts as 0
+	local has_update=0
+	if [ -n "$latest_version" ] && [ "$current_version" != "unknown" ] && [ "$current_version" != "$latest_version" ]; then
+		local c_major c_minor c_patch c_rel l_major l_minor l_patch l_rel
+		c_major=$(echo "$current_version" | awk -F. '{print $1}' | sed 's/[^0-9].*//')
+		c_minor=$(echo "$current_version" | awk -F. '{print $2}' | sed 's/[^0-9].*//')
+		c_patch=$(echo "$current_version" | awk -F. '{print $3}' | sed 's/[^0-9].*//')
+		c_rel=$(echo "$current_version" | sed -n 's/.*-r\([0-9][0-9]*\).*/\1/p')
+		l_major=$(echo "$latest_version" | awk -F. '{print $1}' | sed 's/[^0-9].*//')
+		l_minor=$(echo "$latest_version" | awk -F. '{print $2}' | sed 's/[^0-9].*//')
+		l_patch=$(echo "$latest_version" | awk -F. '{print $3}' | sed 's/[^0-9].*//')
+		l_rel=$(echo "$latest_version" | sed -n 's/.*-r\([0-9][0-9]*\).*/\1/p')
+		[ -z "$c_major" ] && c_major=0
+		[ -z "$c_minor" ] && c_minor=0
+		[ -z "$c_patch" ] && c_patch=0
+		[ -z "$c_rel" ] && c_rel=0
+		[ -z "$l_major" ] && l_major=0
+		[ -z "$l_minor" ] && l_minor=0
+		[ -z "$l_patch" ] && l_patch=0
+		[ -z "$l_rel" ] && l_rel=0
+
+		if [ "$l_major" -gt "$c_major" ] 2>/dev/null; then
+			has_update=1
+		elif [ "$l_major" -eq "$c_major" ] 2>/dev/null; then
+			if [ "$l_minor" -gt "$c_minor" ] 2>/dev/null; then
+				has_update=1
+			elif [ "$l_minor" -eq "$c_minor" ] 2>/dev/null; then
+				if [ "$l_patch" -gt "$c_patch" ] 2>/dev/null; then
+					has_update=1
+				elif [ "$l_patch" -eq "$c_patch" ] 2>/dev/null; then
+					if [ "$l_rel" -gt "$c_rel" ] 2>/dev/null; then
+						has_update=1
+					fi
+				fi
+			fi
+		fi
+	fi
+
+	# build the answer
+	json_init
+	json_add_string "current_version" "$current_version"
+	json_add_string "latest_version" "${latest_version:-unknown}"
+	json_add_boolean "has_update" "$has_update"
+	json_add_string "download_url" "$download_url"
+	json_add_string "release_url" "$release_url"
+	json_add_string "release_body" "$release_body"
+	if [ -n "$error_msg" ]; then
+		json_add_string "error" "$error_msg"
+	fi
+	local result
+	result=$(json_dump)
+
+	# save it to the cache file
+	mkdir -p /tmp/dashboard
+	printf '%s' "$result" > "$dat_file"
+	if [ -n "$error_msg" ]; then
+		echo $((now - 3600 + 300)) > "$ts_file"
+	else
+		echo "$now" > "$ts_file"
+	fi
+
+	rm -f "$lock_file"
+}
+
+# update_check
+# takes force as a bool
+# returns the cached data right away and does the fetch in the background
+# if it is old. the github call takes 30s and rpcd only has one thread, so
+# waiting for it would make the other calls fail
+update_check() {
+	local force
+	json_load "$1"
+	json_get_var force force
+	json_cleanup
+
+	local now ts_file dat_file lock_file
+	now=$(date +%s)
+	ts_file="/tmp/dashboard/update_check_ts"
+	dat_file="/tmp/dashboard/update_check.json"
+	lock_file="/tmp/dashboard/update_check.lock"
+
+	# get the installed version, no network needed
+	local current_version="unknown"
+	if [ -f /lib/apk/db/installed ]; then
+		current_version=$(grep -A1 '^P:luci-app-dashboard$' /lib/apk/db/installed 2>/dev/null | grep '^V:' | sed 's/^V://')
+	else
+		local ctrl="/usr/lib/opkg/info/luci-app-dashboard.control"
+		if [ -f "$ctrl" ]; then
+			current_version=$(grep '^Version:' "$ctrl" | sed 's/^Version://')
+		fi
+	fi
+	current_version=$(echo "$current_version" | tr -d '[:space:]')
+
+	# a fetch is already running, tell the frontend to keep asking
+	# the lock is 35s, the fetch timeout is 30s, so an older lock means
+	# the fetch died and we can throw it away
+	# this check comes first, otherwise polling would just get the old
+	# cache while the fetch is running
+	if [ -f "$lock_file" ]; then
+		local lock_age
+		lock_age=$(cat "$lock_file" 2>/dev/null)
+		if [ -n "$lock_age" ] && [ "$((now - lock_age))" -lt 35 ]; then
+			json_init
+			json_add_string "current_version" "$current_version"
+			json_add_string "latest_version" "unknown"
+			json_add_boolean "has_update" 0
+			json_add_string "error" "checking"
+			json_dump
+			return 0
+		fi
+		rm -f "$lock_file"
+	fi
+
+	# look in the cache, it is good for an hour
+	if [ "$force" != "1" ]; then
+		if [ -f "$ts_file" ]; then
+			local prev
+			prev=$(cat "$ts_file" 2>/dev/null)
+			if [ -n "$prev" ] && [ "$((now - prev))" -le 3600 ]; then
+				if [ -f "$dat_file" ]; then
+					cat "$dat_file"
+					return 0
+				fi
+			fi
+		fi
+	fi
+
+	# run the fetch in the background
+	echo "$now" > "$lock_file"
+	( _do_update_check "$current_version" ) >/dev/null 2>&1 &
+
+	# with force we always say "checking" so the frontend waits for the
+	# new data, without it we use the cache when we have one
+	if [ "$force" = "1" ] || [ ! -f "$dat_file" ]; then
+		json_init
+		json_add_string "current_version" "$current_version"
+		json_add_string "latest_version" "unknown"
+		json_add_boolean "has_update" 0
+		json_add_string "error" "checking"
+		json_dump
+	else
+		cat "$dat_file"
+	fi
+}
+
+# vnstat_info
+# backup file, live db, timestamps and free space
+vnstat_info() {
+	local backup_exists=0 backup_size_kb="" backup_mtime=""
+	local db_exists=0 db_size_kb=""
+	local last_backup_ts="" last_backup_trigger=""
+	local last_restore_ts="" last_restore_trigger=""
+	local auto_enabled=0 auto_interval="every 12 h"
+
+	if [ -f "$BACKUP_FILE" ]; then
+		backup_exists=1
+		local bk_size
+		bk_size=$(wc -c < "$BACKUP_FILE" 2>/dev/null)
+		backup_size_kb=$(( (bk_size + 1023) / 1024 ))
+		backup_mtime=$(date -r "$BACKUP_FILE" "+%Y-%m-%d %I:%M:%S %p" 2>/dev/null)
+	fi
+
+	if [ -f "$DB_SRC" ]; then
+		db_exists=1
+		local db_size
+		db_size=$(wc -c < "$DB_SRC" 2>/dev/null)
+		db_size_kb=$(( (db_size + 1023) / 1024 ))
+	fi
+
+	if [ -f /etc/vnstat/backup/last_backup_ts ]; then
+		local ts
+		ts=$(cat /etc/vnstat/backup/last_backup_ts 2>/dev/null)
+		if [ -n "$ts" ]; then
+			last_backup_ts=$(date -d "@$ts" "+%Y-%m-%d %I:%M:%S %p" 2>/dev/null || date "+%Y-%m-%d %I:%M:%S %p" -r "$ts" 2>/dev/null)
+		fi
+	fi
+
+	if [ -f /etc/vnstat/backup/last_backup_trigger ]; then
+		last_backup_trigger=$(cat /etc/vnstat/backup/last_backup_trigger 2>/dev/null)
+	fi
+
+	if [ -f /etc/vnstat/backup/last_restore_ts ]; then
+		local ts
+		ts=$(cat /etc/vnstat/backup/last_restore_ts 2>/dev/null)
+		if [ -n "$ts" ]; then
+			last_restore_ts=$(date -d "@$ts" "+%Y-%m-%d %I:%M:%S %p" 2>/dev/null || date "+%Y-%m-%d %I:%M:%S %p" -r "$ts" 2>/dev/null)
+		fi
+	fi
+
+	if [ -f /etc/vnstat/backup/last_restore_trigger ]; then
+		last_restore_trigger=$(cat /etc/vnstat/backup/last_restore_trigger 2>/dev/null)
+	fi
+
+	if [ "$(uci -q get dashboard.settings.vnstat_db 2>/dev/null)" = "1" ]; then
+		auto_enabled=1
+	fi
+
+	# free space
+	local tmp_free_kb flash_free_kb
+	tmp_free_kb=$(df -k /tmp 2>/dev/null | awk 'NR==2{print $4}')
+	flash_free_kb=$(df -k /etc/vnstat/backup 2>/dev/null | awk 'NR==2{print $4}')
+	if [ -z "$flash_free_kb" ] || [ "$flash_free_kb" = "0" ]; then
+		flash_free_kb=$(df -k /etc 2>/dev/null | awk 'NR==2{print $4}')
+	fi
+
+	json_init
+	json_add_boolean "backup_exists" "$backup_exists"
+	json_add_string "backup_size_kb" "$backup_size_kb"
+	json_add_string "backup_mtime" "$backup_mtime"
+	json_add_boolean "db_exists" "$db_exists"
+	json_add_string "db_size_kb" "$db_size_kb"
+	json_add_string "last_backup_ts" "$last_backup_ts"
+	json_add_string "last_backup_trigger" "$last_backup_trigger"
+	json_add_string "last_restore_ts" "$last_restore_ts"
+	json_add_string "last_restore_trigger" "$last_restore_trigger"
+	json_add_boolean "auto_enabled" "$auto_enabled"
+	json_add_string "auto_interval" "$auto_interval"
+	json_add_string "tmp_free_kb" "$tmp_free_kb"
+	json_add_string "flash_free_kb" "$flash_free_kb"
+	json_dump
+}
+
+# vnstat_backup
+vnstat_backup() {
+	local ret
+	/usr/sbin/vnstat_backup 2>/dev/null
+	ret=$?
+
+	json_init
+	if [ "$ret" = "0" ] && [ -f "$BACKUP_FILE" ]; then
+		local bk_size mtime
+		bk_size=$(wc -c < "$BACKUP_FILE" 2>/dev/null)
+		bk_size=$(( (bk_size + 1023) / 1024 ))
+		mtime=$(date -r "$BACKUP_FILE" "+%Y-%m-%d %I:%M:%S %p" 2>/dev/null)
+		json_add_boolean "ok" 1
+		json_add_string "message" "Backup completed successfully."
+		json_add_string "size_kb" "$bk_size"
+		json_add_string "mtime" "$mtime"
+	else
+		json_add_boolean "ok" 0
+		json_add_string "error" "Backup command failed (exit $ret)."
+	fi
+	json_dump
+}
+
+# vnstat_restore
+vnstat_restore() {
+	# a file was uploaded to /tmp, move it to flash first
+	local from_upload=0
+  if [ -f "$STAGED_FILE" ]; then
+ 		mkdir -p /etc/vnstat/backup
+ 		if mv "$STAGED_FILE" "$BACKUP_FILE" 2>/dev/null; then
+ 			from_upload=1
+ 		elif cp "$STAGED_FILE" "$BACKUP_FILE" 2>/dev/null; then
+ 			from_upload=1
+ 			rm -f "$STAGED_FILE" 2>/dev/null
+ 		else
+ 			rm -f "$BACKUP_FILE" 2>/dev/null
+ 			json_init
+ 			json_add_boolean "ok" 0
+ 			json_add_string "error" "Failed to stage uploaded file (flash full?)"
+ 			json_dump
+ 			return 0
+ 		fi
+ 	fi
+
+	if [ ! -f "$BACKUP_FILE" ]; then
+		json_init
+		json_add_boolean "ok" 0
+		json_add_string "error" "No backup file found in flash or /tmp."
+		json_dump
+		return 0
+	fi
+
+	local ret
+	/usr/sbin/vnstat_restore 2>/dev/null
+	ret=$?
+
+	local ts_now
+	ts_now=$(date +%s)
+
+	if [ "$from_upload" = "1" ]; then
+		echo "$ts_now" > /etc/vnstat/backup/last_backup_ts
+		echo "upload" > /etc/vnstat/backup/last_backup_trigger
+		echo "$ts_now" > /etc/vnstat/backup/last_restore_ts
+		echo "upload" > /etc/vnstat/backup/last_restore_trigger
+	else
+		echo "$ts_now" > /etc/vnstat/backup/last_restore_ts
+		echo "manual" > /etc/vnstat/backup/last_restore_trigger
+	fi
+
+	json_init
+	if [ "$ret" = "0" ]; then
+		local bk_size mtime trigger
+		bk_size=$(wc -c < "$BACKUP_FILE" 2>/dev/null)
+		bk_size=$(( (bk_size + 1023) / 1024 ))
+		mtime=$(date -r "$BACKUP_FILE" "+%Y-%m-%d %I:%M:%S %p" 2>/dev/null)
+		if [ "$from_upload" = "1" ]; then
+			trigger="upload"
+		else
+			trigger="manual"
+		fi
+		json_add_boolean "ok" 1
+		json_add_string "message" "Database restored successfully."
+		json_add_string "ts" "$(date '+%Y-%m-%d %I:%M:%S %p')"
+		json_add_string "size_kb" "$bk_size"
+		json_add_string "mtime" "$mtime"
+		json_add_string "trigger" "$trigger"
+	else
+		json_add_boolean "ok" 0
+		json_add_string "error" "Restore command failed (exit $ret)."
+	fi
+	json_dump
+}
+
+# rpcd dispatch
+
+case "$1" in
+	list)
+		cat <<'EOF'
+{
+	"get_data": {},
+	"force_refresh": {},
+	"get_settings": {},
+	"set_settings": { "key": "str", "val": "str" },
+	"fix_cron": {},
+	"update_check": { "force": "bool" },
+	"vnstat_info": {},
+	"vnstat_backup": {},
+	"vnstat_restore": {}
+}
+EOF
+		;;
+	call)
+		input=""
+		case "$2" in
+			get_data)         get_data ;;
+			force_refresh)    force_refresh ;;
+			get_settings)     get_settings ;;
+			set_settings)     read -r input 2>/dev/null; set_settings "$input" ;;
+			fix_cron)         fix_cron ;;
+			update_check)     read -r input 2>/dev/null; update_check "$input" ;;
+			vnstat_info)      vnstat_info ;;
+			vnstat_backup)    vnstat_backup ;;
+			vnstat_restore)   vnstat_restore ;;
+		esac
+		;;
+esac

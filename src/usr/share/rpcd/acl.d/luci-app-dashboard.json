@@ -1,0 +1,1 @@
+{"luci-app-dashboard": {"description": "Grant access to LuCI app dashboard", "read": {"cgi-io": ["exec"], "ubus": {"dashboard": ["get_data", "get_settings", "update_check", "vnstat_info"]}, "uci": ["dashboard"]}, "write": {"cgi-io": ["exec"], "ubus": {"dashboard": ["force_refresh", "set_settings", "fix_cron", "vnstat_backup", "vnstat_restore"]}, "uci": ["dashboard"]}}}

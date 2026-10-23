@@ -1,0 +1,3 @@
+#!/bin/sh
+# global command, it just calls the dashboard monitor
+exec /usr/sbin/dashboard_monitor _cron_run "${1:-manual}"

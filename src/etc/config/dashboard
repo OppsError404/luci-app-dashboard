@@ -1,0 +1,6 @@
+config dashboard 'settings'
+	option vnstat  '1'
+	option vnstat_db '0'
+	option multi_core '1'
+	# multi_core is auto-detected by /etc/init.d/dashboard on first boot
+	# if not explicitly set. Set to 0 to force single-core display.

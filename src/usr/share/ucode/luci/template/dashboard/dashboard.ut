@@ -1,0 +1,698 @@
+{% include('header') %}
+<meta charset="utf-8" />
+<link rel="stylesheet" href="/luci-static/resources/view/dashboard/dashboard.css" />
+<script>
+var DASHBOARD_SID = "{{ ctx.authsession }}";
+function ubusCall(obj, method, params) {
+  return fetch("/ubus", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0", id: 1,
+      method: "call",
+      params: [DASHBOARD_SID, obj, method, params || {}]
+    })
+  }).then(function(r) { return r.json(); }).then(function(res) {
+    if (res.result && res.result[0] === 0) return res.result[1];
+    var msg = (res.error && res.error.message) || "ubus call failed";
+    var err = new Error(msg);
+    err.transient = (msg === "Object not found" || msg === "Timeout" || msg === "Connection failed" || msg === "Permission denied");
+    throw err;
+  });
+}
+</script>
+{%
+import { readfile } from 'fs';
+let svg = readfile("/www/luci-static/resources/icons/dashboard_icons.svg");
+if (!svg) svg = readfile("/tmp/luci-static/resources/icons/dashboard_icons.svg");
+if (svg) print(svg);
+%}
+
+<div id="custom_status_container">
+  <div
+    id="error_banner"
+    style="color: red; text-align: center; display: none; margin: 8px 0"
+  >
+    Realtime data unavailable
+  </div>
+  <!-- Loading Overlay -->
+  <div
+    id="dashboard_loading_overlay"
+    aria-live="polite"
+    aria-label="Loading data"
+  >
+    <div class="dlo_inner">
+      <svg
+        aria-hidden="true"
+        class="dlo_spinner"
+        viewBox="0 0 44 44"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <circle
+          class="dlo_track"
+          cx="22"
+          cy="22"
+          r="18"
+          fill="none"
+          stroke-width="3"
+        />
+        <circle
+          class="dlo_arc"
+          cx="22"
+          cy="22"
+          r="18"
+          fill="none"
+          stroke-width="3"
+          stroke-dasharray="90 200"
+          stroke-dashoffset="0"
+          stroke-linecap="round"
+        />
+      </svg>
+      <span class="dlo_label">Loading</span>
+    </div>
+  </div>
+
+  <!-- Control Card -->
+  <div
+    id="custom_control_card"
+    class="status_card control_card"
+    role="region"
+    aria-label="Realtime controls"
+  >
+    <h2 class="cc_title">Dash<span class="cc_title_accent">board</span></h2>
+    <div class="cc_right">
+      <div class="tile-clock">
+        <div class="tile-date">
+          <svg class="icon icon-calendar-day"><use href="#icon-calendar-day"/></svg><span id="tile_date">-- --</span>
+        </div>
+        <div class="tile-time-row">
+          <button
+            id="force_refresh_btn"
+            class="btn icon only"
+            title="Force refresh"
+            aria-label="Force refresh"
+          >
+            <svg class="icon icon-redo" aria-hidden="true"><use href="#icon-redo"/></svg>
+          </button>
+          <div class="cc_settings_wrap">
+            <button
+              id="settings_btn"
+              class="btn icon only"
+              title="Dashboard settings"
+              aria-label="Dashboard settings"
+              aria-haspopup="true"
+              aria-expanded="false"
+            >
+              <svg class="icon icon-sliders-h" aria-hidden="true"><use href="#icon-sliders-h"/></svg>
+              <span class="badge-dot"></span>
+            </button>
+            <div
+              id="settings_panel"
+              class="cc_settings_panel"
+              role="menu"
+              aria-label="Dashboard settings"
+            >
+              <div class="csp_title">Display</div>
+              <label class="csp_row" role="menuitem">
+                <span class="csp_label"
+                  ><svg class="icon icon-chart-bar"><use href="#icon-chart-bar"/></svg> vnStat Card</span
+                >
+                <span
+                  class="csp_toggle"
+                  id="toggle_vnstat"
+                  data-key="vnstat"
+                  tabindex="0"
+                  role="switch"
+                  aria-checked="true"
+                >
+                  <span class="csp_knob"></span>
+                </span>
+              </label>
+              <div class="csp_sep"></div>
+              <div class="csp_title">Backup</div>
+              <label class="csp_row" role="menuitem">
+                <span class="csp_label"
+                  ><svg class="icon icon-database"><use href="#icon-database"/></svg> DB Auto Backup</span
+                >
+                <span
+                  class="csp_toggle"
+                  id="toggle_vnstat_db"
+                  data-key="vnstat_db"
+                  tabindex="0"
+                  role="switch"
+                  aria-checked="false"
+                >
+                  <span class="csp_knob"></span>
+                </span>
+              </label>
+              <div class="csp_status_row" id="vnstat_db_status">
+                <span class="csp_status_dot" id="vnstat_db_status_dot"></span>
+                <span class="csp_status_text" id="vnstat_db_status_text"
+                  >checking…</span
+                >
+                <button
+                  class="csp_fix_button hidden"
+                  id="vnstat_db_fix_button"
+                  title="Click to fix missing cron job"
+                >
+                  Fix
+                </button>
+              </div>
+              <div class="csp_backup_btn_wrap">
+                <a
+                  class="csp_backup_btn"
+                  href="/cgi-bin/luci/admin/status/vnstat2/backup"
+                  role="menuitem"
+                >
+                  <svg class="icon icon-external-link-alt"><use href="#icon-external-link-alt"/></svg>
+                  <span>Open Backup Page</span>
+                </a>
+              </div>
+              <div class="csp_sep"></div>
+              <div class="csp_title">Update</div>
+              <div class="csp_update_wrap" id="update_check_wrap">
+                <div class="csp_update_row">
+                  <span class="csp_label"
+                    ><svg class="icon icon-info-circle"><use href="#icon-info-circle"/></svg> Current</span
+                  >
+                  <span class="csp_update_ver" id="update_current_ver">--</span>
+                </div>
+                <div class="csp_update_row">
+                  <span class="csp_label"
+                    ><svg class="icon icon-tag"><use href="#icon-tag"/></svg> Latest</span
+                  >
+                  <span class="csp_update_ver" id="update_latest_ver">--</span>
+                </div>
+                <div class="csp_update_status" id="update_status">
+                  <span class="csp_update_status_text" id="update_status_text"
+                    >checking…</span
+                  >
+                </div>
+                <div class="csp_update_actions" id="update_actions">
+                  <button
+                    class="csp_update_btn csp_update_btn_check"
+                    id="update_check_btn"
+                    title="Check for updates"
+                  >
+                    <svg class="icon icon-sync-alt"><use href="#icon-sync-alt"/></svg> Check
+                  </button>
+                  <a
+                    class="csp_update_btn csp_update_btn_download hidden"
+                    id="update_download_btn"
+                    target="_blank"
+                    title="Download update package"
+                  >
+                    <svg class="icon icon-download"><use href="#icon-download"/></svg> Download
+                  </a>
+                  <a
+                    class="csp_update_btn csp_update_btn_release hidden"
+                    id="update_release_btn"
+                    target="_blank"
+                    title="View release notes"
+                  >
+                    <svg class="icon icon-external-link-alt"><use href="#icon-external-link-alt"/></svg> Notes
+                  </a>
+                  <button
+                    class="csp_update_btn csp_update_btn_copy hidden"
+                    id="update_copy_btn"
+                    type="button"
+                    title="Copy install command"
+                  >
+                    <svg class="icon icon-copy"><use href="#icon-copy"/></svg> Copy
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="tile-time">
+            <span id="current_time">--:--:--</span
+            ><span class="tile-ampm" id="tile_ampm">--</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Network Card -->
+  <div class="status_card network">
+    <div class="card_header_wrap">
+      <h3 class="header_center"><svg class="icon icon-globe"><use href="#icon-globe"/></svg> Network</h3>
+    </div>
+    <div class="info_row net_status_row">
+      <div class="info_label">Internet Status</div>
+      <div class="info_value net_status_cell">
+        <div class="net_status_popover">
+          <button
+            type="button"
+            id="net_status_trigger"
+            class="net_status_trigger"
+            aria-expanded="false"
+            aria-controls="ping_chart_panel"
+            title="Ping (RTT) history"
+          >
+            <span id="net_status" class="badge">N/A</span>
+            <span class="net_status_chevron" aria-hidden="true"
+              ><svg class="icon icon-chart-line"><use href="#icon-chart-line"/></svg>
+            ></span>
+          </button>
+          <div
+            id="ping_chart_panel"
+            class="ping_chart_popup"
+            role="region"
+            aria-label="Ping RTT history"
+            hidden
+          >
+            <div class="ping_chart_popup_inner">
+              <div class="ping_chart_popup_head">Ping (RTT)</div>
+              <div class="ping_chart_wrap">
+                <canvas id="pingChart" height="88"></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="info_row">
+      <div class="info_label">Public IPv4</div>
+      <div class="info_value">
+        <span id="net_public_ip">N/A</span>
+        <button
+          class="ip-eye-btn ip-eye-btn--masked"
+          id="ipv4_eye_btn"
+          aria-label="Toggle IPv4 visibility"
+        >
+           <svg class="icon icon-eye"><use href="#icon-eye"/></svg>
+           <svg class="icon icon-eye-slash"><use href="#icon-eye-slash"/></svg>
+        </button>
+      </div>
+    </div>
+    <div id="ipv6_block">
+      <div class="info_row">
+        <div class="info_label">Public IPv6</div>
+        <div class="info_value">
+          <span id="net_public_ipv6">N/A</span>
+          <button
+            class="ip-eye-btn ip-eye-btn--masked"
+            id="ipv6_eye_btn"
+            aria-label="Toggle IPv6 visibility"
+          >
+             <svg class="icon icon-eye"><use href="#icon-eye"/></svg>
+             <svg class="icon icon-eye-slash"><use href="#icon-eye-slash"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+    <div class="info_row">
+      <div class="info_label">ISP</div>
+      <div class="info_value"><span id="net_isp">N/A</span></div>
+    </div>
+    <div class="info_row" id="wan_uptime_row">
+      <div class="info_label" id="net_wan_uptime_label">WAN Uptime</div>
+      <div class="info_value"><span id="net_wan_uptime">N/A</span></div>
+    </div>
+    <div id="wan_down_msg"></div>
+
+    <div class="faded_sep" aria-hidden="true"></div>
+
+    <!-- WAN Traffic -->
+    <div class="wan_block" role="group" aria-label="WAN Traffic">
+      <div class="wan_title_row">
+        <h4 class="wan_traffic_title">WAN Traffic</h4>
+        <div class="wan-unit-dropdown" id="wan_unit_dropdown">
+          <button
+            class="wan-unit-trigger"
+            id="wan_unit_trigger"
+            aria-haspopup="listbox"
+            aria-expanded="false"
+          >
+            <span id="wan_unit_label">MB/s</span>
+            <svg
+              aria-hidden="true"
+              class="wan-unit-chevron"
+              viewBox="0 0 10 6"
+              width="9"
+              height="9"
+              fill="none"
+            >
+              <path
+                d="M1 1l4 4 4-4"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+          <div
+            class="wan-unit-menu"
+            id="wan_unit_menu"
+            role="listbox"
+            aria-label="WAN unit"
+          >
+            <div
+              class="wan-unit-option active"
+              data-unit="MBs"
+              role="option"
+              aria-selected="true"
+            >
+              MB/s <span class="wan-unit-hint">binary</span>
+            </div>
+            <div
+              class="wan-unit-option"
+              data-unit="Mbps"
+              role="option"
+              aria-selected="false"
+            >
+              Mbps <span class="wan-unit-hint">decimal</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="wan_rates_row">
+        <div class="wan_rate_box wan_rate_rx">
+          <span id="wan_rx_value" class="wan_rate_val">0 B/s</span>
+          <span class="wan_rate_meta"
+            ><svg class="icon icon-arrow-down"><use href="#icon-arrow-down"/></svg> Down-Rate</span
+          >
+        </div>
+        <div class="wan_rate_box wan_rate_tx">
+          <span id="wan_tx_value" class="wan_rate_val">0 B/s</span>
+          <span class="wan_rate_meta"
+            ><svg class="icon icon-arrow-up"><use href="#icon-arrow-up"/></svg> Up-Rate</span
+          >
+        </div>
+      </div>
+      <div class="wan_merged_chart dash-chart-reveal">
+        <canvas id="netChart" height="140"></canvas>
+      </div>
+      <div class="sub_stat_row wan_sub_stat">
+        <span class="sub_stat_chunk"
+          >Rx — Avg: <span id="wan_rx_avg">--</span> &nbsp; Max:
+          <span id="wan_rx_max">--</span></span
+        >
+        <span class="sub_stat_sep" aria-hidden="true">|</span>
+        <span class="sub_stat_chunk"
+          >Tx — Avg: <span id="wan_tx_avg">--</span> &nbsp; Max:
+          <span id="wan_tx_max">--</span></span
+        >
+      </div>
+    </div>
+    <div class="wan_client_btn_wrap" style="display: none">
+      <a
+        href="/cgi-bin/luci/admin/services/client_monitor"
+        class="wan_client_btn"
+        title="Client Monitor"
+      >
+        <svg class="icon icon-users"><use href="#icon-users"/></svg>
+        <span>View Per Client Usage Rates</span>
+        <svg class="icon icon-external-link-alt wan_client_btn_ext"><use href="#icon-external-link-alt"/></svg>
+      </a>
+    </div>
+  </div>
+
+  <!-- CPU & Memory Card -->
+  <div class="status_card cpu_graphs">
+    <div class="card_header_wrap">
+      <h3 class="header_center"><svg class="icon icon-microchip"><use href="#icon-microchip"/></svg> System</h3>
+    </div>
+      <div class="up5_row">
+        <a
+          href="/cgi-bin/luci/admin/status/overview"
+          class="up5_widget model_widget"
+          title="Open Status Overview"
+        >
+          <div class="up5_stack">
+            <span class="up5_lbl">Model</span>
+            <span class="up5_val model_val" id="router_model_val">--</span>
+          </div>
+        </a>
+      <a
+        href="/cgi-bin/luci/admin/status/overview"
+        class="up5_widget uptime_widget"
+        title="Open Status Overview"
+      >
+        <div class="up5_stack">
+          <span class="up5_lbl">System Uptime</span>
+          <span class="up5_val" id="system_uptime_control">N/A</span>
+        </div>
+      </a>
+    </div>
+    <h3 class="header_left"><svg class="icon icon-chart-area"><use href="#icon-chart-area"/></svg> CPU Usage</h3>
+    <div class="cpu_stat_row">
+      <span
+        >Load: <strong><span id="cpuPercentText">--.-%</span></strong></span
+      >
+      <span id="cpuTempBadge" class="temp_badge temp_badge_ok">-- °C</span>
+    </div>
+    <div class="cpu_bar_container">
+      <div id="cpuBarFill" class="cpu_bar"></div>
+    </div>
+    <div class="sub_stat_row">
+      Avg: <span id="cpuAvgText">--.-%</span> &nbsp; Max:
+      <span id="cpuMaxText">--.-%</span>
+    </div>
+    <div class="cpu_merged_chart dash-chart-reveal dash-chart-reveal--delay">
+      <canvas id="cpuLineChart" height="100"></canvas>
+    </div>
+    <div class="faded_sep faded_sep--flush" aria-hidden="true"></div>
+    <h5 class="header_left mem_header"><svg class="icon icon-memory"><use href="#icon-memory"/></svg> Memory</h5>
+    <div class="mem_arc_row">
+      <div class="mem_arc_wrap">
+        <svg aria-hidden="true" width="86" height="50" viewBox="0 0 86 50">
+          <path
+            class="mem_arc_track"
+            d="M 7 46 A 36 36 0 0 1 79 46"
+            fill="none"
+            stroke="rgba(255,255,255,0.06)"
+            stroke-width="6"
+            stroke-linecap="round"
+          />
+          <path
+            id="mem_arc_fill"
+            d="M 7 46 A 36 36 0 0 1 79 46"
+            fill="none"
+            stroke="#26c6da"
+            stroke-width="6"
+            stroke-linecap="round"
+            stroke-dasharray="113 113"
+            stroke-dashoffset="113"
+            style="
+              transition:
+                stroke-dashoffset 0.6s cubic-bezier(0.2, 0.8, 0.2, 1),
+                stroke 0.4s ease;
+            "
+          />
+        </svg>
+        <div class="mem_arc_pct" id="mem_arc_pct">--%</div>
+      </div>
+      <div class="mem_arc_vals">
+        <div class="mem_arc_stat mem_arc_stat--first">
+          Used: <span id="custom_mem">N/A</span>
+        </div>
+        <div class="mem_arc_stat">
+          Free: <span id="mem_free_text">N/A</span>
+        </div>
+      </div>
+      <div class="mem_spark_panel">
+        <div class="mem_spark_label">History</div>
+        <div class="mem_spark_outer">
+          <canvas id="mem_sparkline"></canvas>
+          <div id="mem_spark_tooltip" class="mem_spark_tooltip"></div>
+        </div>
+      </div>
+    </div>
+    <div class="mem_bar_container">
+      <div id="mem_bar" class="mem_bar"></div>
+    </div>
+  </div>
+
+  <!-- Clients Card -->
+  <div class="status_card clients">
+    <div class="card_header_wrap">
+      <h3 class="header_center"><svg class="icon icon-users"><use href="#icon-users"/></svg> Clients</h3>
+    </div>
+    <div class="cl_tiles_inner">
+      <!-- Wireless tile -->
+      <div class="cl_tile" id="wifi_tile">
+        <div class="cl_tile_head" id="wifi_tile_head">
+          <div class="cl_tile_head_left">
+            <div class="cl_tile_icon cl_icon_wifi">
+              <svg class="icon icon-wifi"><use href="#icon-wifi"/></svg>
+            </div>
+            Wireless
+          </div>
+          <span class="cl_badge cl_badge_wifi" id="custom_wifi_total">0</span>
+        </div>
+        <div class="cl_tile_body" id="custom_wifi_ap_list"></div>
+        <div class="cl_temp_foot" id="wifi_temp_foot">
+          <svg class="icon icon-microchip"><use href="#icon-microchip"/></svg>
+          <span>Wireless Controller Temperature</span>
+          <span class="cl_temp_val" id="custom_wifi_temp">-- °C</span>
+          <span class="cl_tdot" id="wifi_temp_dot"></span>
+        </div>
+        <div class="cl_no_wifi_module" id="no_wifi_module" style="display:none">
+          <div class="cl_no_wifi_icon">
+            <svg class="icon icon-wifi"><use href="#icon-wifi"/></svg>
+            <svg class="icon icon-slash"><use href="#icon-slash"/></svg>
+          </div>
+          <div class="cl_no_wifi_text">No wireless module detected</div>
+          <div class="cl_no_wifi_sub">Device lacks wireless module or module is disabled</div>
+        </div>
+      </div>
+
+      <!-- LAN tile -->
+      <div class="cl_tile cl_tile--spaced">
+        <div class="cl_tile_head">
+          <div class="cl_tile_head_left">
+            <div class="cl_tile_icon cl_icon_lan">
+              <svg class="icon icon-network-wired"><use href="#icon-network-wired"/></svg>
+            </div>
+            LAN
+          </div>
+          <span class="cl_badge cl_badge_lan" id="custom_lan_total">0</span>
+        </div>
+        <div class="cl_tile_body" id="custom_lan_ports"></div>
+        <div class="cl_port_strip" id="custom_lan_port_strip">
+          <span class="cl_port_strip_label">Ports</span>
+          <div class="cl_port_dots" id="custom_lan_port_dots"></div>
+        </div>
+      </div>
+    </div>
+    <!-- /.cl_tiles_inner -->
+  </div>
+
+  <!-- Usage Card -->
+  <div class="status_card usage" id="vnstat_card">
+    <div class="usage_title_row card_header_wrap">
+      <h3 class="header_center"><svg class="icon icon-chart-line"><use href="#icon-chart-line"/></svg> Usage</h3>
+      <div
+        class="wan-unit-dropdown"
+        id="vn_iface_dropdown"
+        style="display: none"
+      >
+        <button
+          class="wan-unit-trigger"
+          id="vn_iface_trigger"
+          aria-haspopup="listbox"
+          aria-expanded="false"
+        >
+          <span id="vn_iface_label"></span>
+          <svg
+            aria-hidden="true"
+            class="wan-unit-chevron"
+            viewBox="0 0 10 6"
+            width="9"
+            height="9"
+            fill="none"
+          >
+            <path
+              d="M1 1l4 4 4-4"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+        <div
+          class="wan-unit-menu"
+          id="vn_iface_menu"
+          role="listbox"
+          aria-label="Interface"
+        >
+          <!-- populated dynamically -->
+        </div>
+      </div>
+    </div>
+
+    <!-- vnStat warning (not installed, empty database, etc.) -->
+    <div id="vnstat_warning" class="vnstat_warn" style="display: none"></div>
+
+    <!-- Normal vnStat content (hidden when warning is shown) -->
+    <div id="vnstat_content">
+      <div class="usage_total_row">
+        <div class="usage_total_block">
+          <div class="usage_total_label">Today</div>
+          <div class="usage_total_val">
+            <span id="vn_daily_total">N/A</span>
+          </div>
+        </div>
+        <div class="usage_total_divider"></div>
+        <div class="usage_total_block">
+          <div class="usage_total_label">Monthly</div>
+          <div class="usage_total_val">
+            <span id="vn_monthly_total">N/A</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="faded_sep" aria-hidden="true"></div>
+
+      <!-- Today tile -->
+      <div class="usage_period_tile">
+        <div class="usage_pt_head">
+          <div class="usage_pt_icon usage_icon_today">
+            <svg class="icon icon-calendar-day"><use href="#icon-calendar-day"/></svg>
+          </div>
+          <span id="vn_daily_header">Today</span>
+        </div>
+        <div class="usage_pt_body">
+          <div class="usage_pt_cell">
+            <span class="usage_ck"
+              ><svg class="icon icon-arrow-down rx_col"><use href="#icon-arrow-down"/></svg> Download</span
+            >
+            <span class="usage_cv rx_col" id="vn_daily_rx">N/A</span>
+          </div>
+          <div class="usage_pt_cell">
+            <span class="usage_ck"
+              ><svg class="icon icon-arrow-up tx_col"><use href="#icon-arrow-up"/></svg> Upload</span
+            >
+            <span class="usage_cv tx_col" id="vn_daily_tx">N/A</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Monthly tile -->
+      <div class="usage_period_tile">
+        <div class="usage_pt_head">
+          <div class="usage_pt_icon usage_icon_monthly">
+            <svg class="icon icon-calendar-alt"><use href="#icon-calendar-alt"/></svg>
+          </div>
+          <span id="vn_monthly_header">Monthly</span>
+        </div>
+        <div class="usage_pt_body">
+          <div class="usage_pt_cell">
+            <span class="usage_ck"
+              ><svg class="icon icon-arrow-down rx_col"><use href="#icon-arrow-down"/></svg> Download</span
+            >
+            <span class="usage_cv rx_col" id="vn_monthly_rx">N/A</span>
+          </div>
+          <div class="usage_pt_cell">
+            <span class="usage_ck"
+              ><svg class="icon icon-arrow-up tx_col"><use href="#icon-arrow-up"/></svg> Upload</span
+            >
+            <span class="usage_cv tx_col" id="vn_monthly_tx">N/A</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Graphs link -->
+      <div class="usage_graphs_btn_wrap">
+        <a
+          href="/cgi-bin/luci/admin/status/vnstat2/graphs"
+          class="usage_graphs_btn"
+          title="Open vnStat bandwidth graphs"
+        >
+          <svg class="icon icon-chart-bar"><use href="#icon-chart-bar"/></svg>
+          <span>View Detailed Usage Graphs</span>
+          <svg class="icon icon-external-link-alt usage_graphs_ext"><use href="#icon-external-link-alt"/></svg>
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <script src="/luci-static/resources/view/dashboard/chart.min.js"></script>
+
+  <script src="/luci-static/resources/view/dashboard/dashboard.js"></script>
+{% include('footer') %}
+</div>

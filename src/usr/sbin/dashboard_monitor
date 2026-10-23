@@ -1,0 +1,334 @@
+#!/bin/sh
+
+NAME="dashboard_monitor"
+UCI_CFG="dashboard"
+
+DOWNTIME_STATE_DIR="/tmp/dashboard/downtime"
+WAN_DOWN_FILE="/tmp/dashboard/wan_down_time"
+INET_DOWN_FILE="/tmp/dashboard/internet_down_time"
+WAN_STATE_FILE="$DOWNTIME_STATE_DIR/wan_last_state"
+INET_STATE_FILE="$DOWNTIME_STATE_DIR/inet_last_state"
+WAN_IF_FILE="$DOWNTIME_STATE_DIR/wan_iface"
+PING_HOSTS="1.1.1.1 9.9.9.9"
+CHECK_INTERVAL=10
+
+mkdir -p /tmp/dashboard
+
+VNSTAT_DB_SRC="/tmp/lib/vnstat/vnstat.db"
+VNSTAT_BACKUP_DIR="/etc/vnstat/backup"
+VNSTAT_BACKUP_FILE="${VNSTAT_BACKUP_DIR}/vnstat.db.gz"
+VNSTAT_BOOT_FLAG="/tmp/vnstat_db_boot_done"
+VNSTAT_CRONTAB="/etc/crontabs/root"
+VNSTAT_CRON_TAG="dashboard_vnstat_db_backup"
+VNSTAT_CRON_LINE="0 */12 * * * /usr/sbin/dashboard_monitor _cron_run scheduled  # ${VNSTAT_CRON_TAG}"
+
+log() { logger -t "$NAME" "$*"; }
+
+clear_luci_cache() {
+    rm -f /tmp/luci-indexcache /tmp/luci-modulecache /tmp/luci-modulecache* /tmp/luci-*cache* 2>/dev/null
+}
+
+restart_rpcd() {
+    if [ -f /etc/init.d/rpcd ]; then
+        /etc/init.d/rpcd restart 2>/dev/null \
+            && log "rpcd restarted" \
+            || log "WARN rpcd restart failed"
+    fi
+}
+
+reload_uhttpd() {
+    if /etc/init.d/uhttpd enabled 2>/dev/null; then
+        /etc/init.d/uhttpd reload 2>/dev/null \
+            && log "uhttpd reloaded" \
+            || log "WARN uhttpd reload failed"
+    fi
+}
+
+vnstat_check() {
+    if ! command -v vnstatd > /dev/null 2>&1 || [ ! -f /etc/init.d/vnstat ]; then
+        log "vnstat is not installed — skipping"
+        return 1
+    fi
+    return 0
+}
+
+_do_restore() {
+    local trigger="${1:-manual}"
+    vnstat_check || return 0
+
+    if [ ! -s "$VNSTAT_BACKUP_FILE" ]; then
+        log "Restore skipped — no backup found"
+        return 1
+    fi
+
+    /etc/init.d/vnstat stop 2>/dev/null || true
+    mkdir -p "$(dirname "$VNSTAT_DB_SRC")" 2>/dev/null
+
+    local tmp_file="${VNSTAT_DB_SRC}.tmp"
+    if ! gunzip -c "$VNSTAT_BACKUP_FILE" > "$tmp_file" 2>/dev/null; then
+        log "Restore failed — gunzip error"
+        rm -f "$tmp_file"
+        /etc/init.d/vnstat start 2>/dev/null || true
+        return 1
+    fi
+
+    if ! mv "$tmp_file" "$VNSTAT_DB_SRC" 2>/dev/null; then
+        log "Restore failed — mv error"
+        rm -f "$tmp_file"
+        /etc/init.d/vnstat start 2>/dev/null || true
+        return 1
+    fi
+
+    /etc/init.d/vnstat start 2>/dev/null || true
+    date +%s > "/etc/vnstat/backup/last_restore_ts"
+    printf '%s' "$trigger" > "/etc/vnstat/backup/last_restore_trigger"
+    log "Restore OK — trigger=${trigger}"
+    return 0
+}
+
+_do_backup() {
+    local trigger="${1:-scheduled}"
+    vnstat_check || return 0
+
+    if [ ! -s "$VNSTAT_DB_SRC" ]; then
+        log "Backup skipped — source not found"
+        return 1
+    fi
+
+    mkdir -p "$VNSTAT_BACKUP_DIR" 2>/dev/null || return 1
+
+    local free_kb
+    free_kb=$(df -k "$VNSTAT_BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -n "$free_kb" ] && [ "$free_kb" -lt 512 ]; then
+        log "Backup aborted — insufficient flash"
+        return 1
+    fi
+
+    local tmp_file="${VNSTAT_BACKUP_FILE}.tmp"
+    if ! gzip -c "$VNSTAT_DB_SRC" > "$tmp_file" 2>/dev/null; then
+        log "Backup failed — gzip error"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    if ! mv "$tmp_file" "$VNSTAT_BACKUP_FILE" 2>/dev/null; then
+        log "Backup failed — mv error"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    date +%s > "/etc/vnstat/backup/last_backup_ts"
+    printf '%s' "$trigger" > "/etc/vnstat/backup/last_backup_trigger"
+    log "Backup OK — trigger=${trigger}"
+    return 0
+}
+
+_cron_add() {
+    mkdir -p "$(dirname "$VNSTAT_CRONTAB")"
+    touch "$VNSTAT_CRONTAB"
+    if ! grep -qF "$VNSTAT_CRON_TAG" "$VNSTAT_CRONTAB" 2>/dev/null; then
+        echo "$VNSTAT_CRON_LINE" >> "$VNSTAT_CRONTAB"
+        /etc/init.d/cron reload 2>/dev/null || true
+        log "cron job added — backup every 12 h"
+    fi
+}
+
+_detect_wan() {
+    local logical proto ifname ppp_if
+
+    for logical in $(uci show network 2>/dev/null | grep "=interface" | cut -d. -f2 | cut -d= -f1); do
+        case "$logical" in
+            loopback|lan*|br*) continue ;;
+        esac
+        proto=$(uci get network.$logical.proto 2>/dev/null)
+        [ -z "$proto" ] && continue
+        case "$proto" in
+            pppoe|dhcp|static|pppoa|pptp|l2tp|wwan|qmi|mbim) ;;
+            *) continue ;;
+        esac
+        ifname=$(uci get network.$logical.device 2>/dev/null)
+        [ -z "$ifname" ] && ifname=$(uci get network.$logical.ifname 2>/dev/null)
+        case "$proto" in
+            pppoe|pptp|l2tp|pppoa)
+                ppp_if=$(ifstatus "$logical" 2>/dev/null | jsonfilter -e '@["l3_device"]' 2>/dev/null)
+                [ -n "$ppp_if" ] && ifname="$ppp_if"
+                ;;
+        esac
+        [ -z "$ifname" ] && continue
+        ip link show dev "$ifname" >/dev/null 2>&1 || continue
+        ip addr show dev "$ifname" 2>/dev/null | grep -q "inet " || continue
+        WAN_IF="$ifname"
+        echo "$WAN_IF" > "$WAN_IF_FILE"
+        return 0
+    done
+
+    local def_if
+    def_if=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+    if [ -n "$def_if" ]; then
+        WAN_IF="$def_if"
+        echo "$WAN_IF" > "$WAN_IF_FILE"
+        return 0
+    fi
+
+    WAN_IF=""
+    return 1
+}
+
+_check_wan_link() {
+    _detect_wan || { WAN_IF=""; return 1; }
+    [ -z "$WAN_IF" ] && return 1
+    ip addr show dev "$WAN_IF" 2>/dev/null | grep -q "inet " || return 1
+    return 0
+}
+
+_check_internet() {
+    [ -z "$WAN_IF" ] && return 1
+    for host in $PING_HOSTS; do
+        ping -I "$WAN_IF" -c 1 -W 3 "$host" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+_run_monitor() {
+    local prev_wan_state=""
+    local prev_inet_state=""
+
+    mkdir -p "$DOWNTIME_STATE_DIR"
+
+    local tries=0
+    until _detect_wan && [ -n "$WAN_IF" ]; do
+        tries=$((tries + 1))
+        [ $tries -ge 12 ] && break
+        sleep 10
+    done
+
+    if [ -n "$WAN_IF" ]; then
+        log "WAN detected: IF=$WAN_IF"
+    else
+        log "WAN not detected at start — will retry in loop"
+    fi
+
+    if _check_wan_link; then
+        _check_internet && prev_inet_state="up" || prev_inet_state="down"
+        prev_wan_state="up"
+        rm -f "$WAN_DOWN_FILE"
+        [ "$prev_inet_state" = "up" ] && rm -f "$INET_DOWN_FILE"
+    else
+        prev_inet_state="wan_down"
+        prev_wan_state="down"
+        [ ! -f "$WAN_DOWN_FILE" ] && date +%s > "$WAN_DOWN_FILE"
+        [ ! -f "$INET_DOWN_FILE" ] && date +%s > "$INET_DOWN_FILE"
+    fi
+
+    if [ "$prev_wan_state" = "up" ] && [ "$prev_inet_state" = "down" ]; then
+        [ ! -f "$INET_DOWN_FILE" ] && date +%s > "$INET_DOWN_FILE"
+    fi
+
+    echo "$prev_wan_state"  > "$WAN_STATE_FILE"
+    echo "$prev_inet_state" > "$INET_STATE_FILE"
+    log "Initial state  wan=$prev_wan_state  inet=$prev_inet_state"
+
+    while true; do
+        sleep "$CHECK_INTERVAL"
+
+        local cur_wan_state cur_inet_state
+
+        if _check_wan_link; then
+            cur_wan_state="up"
+            _check_internet && cur_inet_state="up" || cur_inet_state="down"
+        else
+            cur_wan_state="down"
+            cur_inet_state="wan_down"
+        fi
+
+        if [ "$cur_wan_state" != "$prev_wan_state" ]; then
+            prev_wan_state="$cur_wan_state"
+            echo "$cur_wan_state" > "$WAN_STATE_FILE"
+
+            if [ "$cur_wan_state" = "down" ]; then
+                date +%s > "$WAN_DOWN_FILE"
+                [ ! -f "$INET_DOWN_FILE" ] && date +%s > "$INET_DOWN_FILE"
+                log "WAN went down (IF=$WAN_IF)"
+            else
+                rm -f "$WAN_DOWN_FILE"
+                log "WAN is up (IF=$WAN_IF)"
+            fi
+        fi
+
+        if [ "$cur_inet_state" != "$prev_inet_state" ]; then
+            prev_inet_state="$cur_inet_state"
+            echo "$cur_inet_state" > "$INET_STATE_FILE"
+
+            if [ "$cur_inet_state" = "down" ]; then
+                if [ ! -f "$INET_DOWN_FILE" ]; then
+                    date +%s > "$INET_DOWN_FILE"
+                    log "Internet down (WAN=$WAN_IF still up)"
+                fi
+            elif [ "$cur_inet_state" = "up" ]; then
+                rm -f "$INET_DOWN_FILE"
+                log "Internet recovered"
+            elif [ "$cur_inet_state" = "wan_down" ]; then
+                [ ! -f "$INET_DOWN_FILE" ] && date +%s > "$INET_DOWN_FILE"
+            fi
+        fi
+    done
+}
+
+_init_service() {
+    log "Init — ensuring rc.d symlink exists..."
+    if [ ! -L /etc/rc.d/S65dashboard ]; then
+        ln -sf /etc/init.d/dashboard /etc/rc.d/S65dashboard 2>/dev/null || true
+    fi
+
+    if [ ! -f "$VNSTAT_BOOT_FLAG" ]; then
+        touch "$VNSTAT_BOOT_FLAG"
+        if [ "$(uci get ${UCI_CFG}.settings.vnstat_db 2>/dev/null)" = "1" ]; then
+            log "Fresh boot — attempting vnstat DB auto restore..."
+            _do_restore "boot-auto" || true
+        fi
+    fi
+
+    if [ "$(uci get ${UCI_CFG}.settings.vnstat_db 2>/dev/null)" = "1" ]; then
+        if ! grep -qF "$VNSTAT_CRON_TAG" "$VNSTAT_CRONTAB" 2>/dev/null; then
+            log "vnstat DB enabled but cron missing — adding now"
+            _cron_add
+        fi
+    fi
+
+    clear_luci_cache
+    reload_uhttpd
+
+    if [ -f /etc/init.d/rpcd ]; then
+        /etc/init.d/rpcd restart 2>/dev/null || true
+    fi
+
+    log "Init complete."
+    return 0
+}
+
+case "${1:-}" in
+    _cron_run)
+        _do_backup "$2"
+        ;;
+    _restore)
+        _do_restore "${2:-manual}"
+        ;;
+    _init)
+        _init_service
+        ;;
+    _run_monitor)
+        _run_monitor
+        ;;
+    _detect_wan)
+        _detect_wan
+        ;;
+    _check_wan_link)
+        _check_wan_link
+        ;;
+    _check_internet)
+        _check_internet
+        ;;
+    *)
+        _init_service || exit 1
+        ;;
+esac

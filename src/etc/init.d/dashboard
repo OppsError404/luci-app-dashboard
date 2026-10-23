@@ -1,0 +1,342 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/dashboard
+
+USE_PROCD=1
+START=65
+STOP=10
+
+NAME="dashboard"
+UCI_CFG="dashboard"
+
+EXTRA_COMMANDS="status \
+                vnstat_enable vnstat_disable \
+                vnstat_backup_enable vnstat_backup_disable \
+                vnstat_backup_fix \
+                vnstat_backup vnstat_restore"
+
+EXTRA_HELP="
+        status                  Show full service status
+        vnstat_enable           Enable the vnStat card on the dashboard
+        vnstat_disable          Disable the vnStat card on the dashboard
+        vnstat_backup_enable    Enable scheduled 12 h vnstat DB backup to flash
+        vnstat_backup_disable   Run final backup then disable scheduled backup
+        vnstat_backup_fix       Add missing cron job for vnstat DB backup
+        vnstat_backup           Immediately back up vnstat DB to flash
+        vnstat_restore          Immediately restore vnstat DB from flash"
+
+log() { logger -t "$NAME" "$*"; }
+
+# unpack the .gz files from flash into ram
+# only our own files, the icons folder is shared with luci-base so we
+# must not touch alias.svg.gz, bridge.svg.gz and the rest
+
+# unpack one .gz file to ram and symlink it back to where it came from.
+# only logs when something goes wrong. files that are already .gz.gz are skipped.
+_decompress_file() {
+    local gz="$1" ram_dir="$2" src_dir="$3"
+
+    [ -f "$gz" ] || return 0
+    case "$gz" in *.gz.gz) return 0;; esac
+
+    local base ram_file target
+    base="$(basename "$gz" .gz)"
+    ram_file="$ram_dir/$base"
+    target="$src_dir/$base"
+
+    [ -f "$ram_file" ] && {
+        [ -L "$target" ] && ln -sf "$ram_file" "$target"
+        return 0
+    }
+
+    mkdir -p "$ram_dir" 2>/dev/null
+    if gunzip -c "$gz" > "$ram_file" 2>/dev/null; then
+        if [ ! -e "$target" ] || [ -L "$target" ]; then
+            ln -sf "$ram_file" "$target"
+        fi
+    else
+        rm -f "$ram_file"
+        log "WARN: failed to decompress $base"
+    fi
+}
+
+# unpack all the .gz files in a folder that only we use
+_decompress_dir() {
+    local src_dir="$1" ram_dir="$2" gz
+    for gz in "$src_dir"/*.gz; do
+        _decompress_file "$gz" "$ram_dir" "$src_dir"
+    done
+}
+
+_decompress_assets() {
+    local view_dir="/www/luci-static/resources/view/dashboard"
+    local view_ram_dir="/tmp/luci-static/resources/view/dashboard"
+    local icon="/www/luci-static/resources/icons/dashboard_icons.svg"
+    local icon_ram="/tmp/luci-static/resources/icons/dashboard_icons.svg"
+    local asset target
+
+    for asset in "$view_dir"/*; do
+        [ -L "$asset" ] || continue
+        target="$(readlink "$asset" 2>/dev/null)"
+        case "$target" in
+            "$view_ram_dir"/*) rm -f "$asset" ;;
+        esac
+    done
+    if [ -L "$icon" ] && [ "$(readlink "$icon" 2>/dev/null)" = "$icon_ram" ]; then
+        rm -f "$icon"
+    fi
+
+    rm -rf "$view_ram_dir"
+    rm -f "$icon_ram"
+
+    _decompress_dir "$view_dir" "$view_ram_dir"
+    # the icons folder is shared, only our own sprite is unpacked
+    _decompress_file "/www/luci-static/resources/icons/dashboard_icons.svg.gz" \
+                      "/tmp/luci-static/resources/icons" \
+                     "/www/luci-static/resources/icons"
+}
+
+# procd hooks
+
+start_service() {
+    auto_detect_multi_core
+    /usr/sbin/dashboard_monitor _init
+
+    _decompress_assets
+
+    procd_open_instance "monitor"
+    procd_set_param command /usr/sbin/dashboard_monitor _run_monitor
+    procd_set_param respawn
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+stop_service() {
+    log "Stopping..."
+
+    # stop the collector daemon if it runs
+    if [ -f /tmp/dashboard/daemon.pid ]; then
+        kill "$(cat /tmp/dashboard/daemon.pid 2>/dev/null)" 2>/dev/null || true
+        rm -f /tmp/dashboard/daemon.pid
+    fi
+
+    rm -f /tmp/luci-indexcache /tmp/luci-modulecache /tmp/luci-*cache* 2>/dev/null
+    rm -f /tmp/dashboard/data.json /tmp/dashboard/heartbeat 2>/dev/null
+    rm -rf /tmp/dashboard/downtime /tmp/dashboard/wan_down_time /tmp/dashboard/internet_down_time 2>/dev/null
+
+    # take the unpacked files and the symlinks away again
+    # view/dashboard is ours, the icons folder is shared so we only
+    # remove our own symlink and leave the other packages alone
+    for f in /www/luci-static/resources/view/dashboard/*; do
+        [ -L "$f" ] && rm -f "$f"
+    done
+    [ -L /www/luci-static/resources/icons/dashboard_icons.svg ] && \
+        rm -f /www/luci-static/resources/icons/dashboard_icons.svg
+    rm -rf /tmp/luci-static/resources/view/dashboard 2>/dev/null
+    rm -f /tmp/luci-static/resources/icons/dashboard_icons.svg 2>/dev/null
+
+    log "Stopped."
+}
+
+reload_service() {
+    log "Reloading..."
+    rm -f /tmp/luci-indexcache /tmp/luci-modulecache /tmp/luci-*cache* 2>/dev/null
+    if /etc/init.d/uhttpd enabled 2>/dev/null; then
+        /etc/init.d/uhttpd reload 2>/dev/null || true
+    fi
+    log "Reloaded."
+}
+
+service_triggers() {
+    procd_add_reload_trigger "uhttpd" "dashboard"
+}
+
+# multi_core detection
+
+auto_detect_multi_core() {
+    local current
+    current="$(uci get ${UCI_CFG}.settings.multi_core 2>/dev/null)" || current=""
+
+    # the user picked a value already, leave it alone
+    [ "$current" = "0" ] || [ "$current" = "1" ] && return 0
+
+    # first time here, count the cores in /proc/stat
+    local n=0
+    if [ -r /proc/stat ]; then
+        n="$(grep -cE '^cpu[0-9]+ ' /proc/stat 2>/dev/null)" || n=0
+    fi
+
+    local val="1"
+    [ "$n" -le 1 ] && val="0"
+
+    uci set "${UCI_CFG}.settings.multi_core=${val}"
+    uci commit "$UCI_CFG"
+    log "multi_core auto-detected: ${val} (found ${n} cores)"
+}
+
+# turn the cards on and off
+
+_uci_set_card() {
+    local key="$1" val="$2" label="$3"
+
+    uci set "${UCI_CFG}.settings.${key}=${val}"
+    uci commit "$UCI_CFG" \
+        && log "${label} card $([ "$val" = "1" ] && echo "enabled" || echo "disabled")" \
+        || { log "ERROR uci commit failed for ${key}"; return 1; }
+
+    rm -f /tmp/dashboard/.force_refresh 2>/dev/null
+    rm -f /tmp/dashboard/data.json 2>/dev/null
+    rm -f /tmp/luci-indexcache /tmp/luci-modulecache /tmp/luci-*cache* 2>/dev/null
+
+    if /etc/init.d/uhttpd enabled 2>/dev/null; then
+        /etc/init.d/uhttpd reload 2>/dev/null || true
+    fi
+}
+
+vnstat_enable()   { _uci_set_card "vnstat"  "1" "vnStat";  }
+vnstat_disable()  { _uci_set_card "vnstat"  "0" "vnStat";  }
+
+# vnstat db backup on and off
+
+vnstat_backup_enable() {
+    if ! command -v vnstatd > /dev/null 2>&1 || [ ! -f /etc/init.d/vnstat ]; then
+        echo "vnstat is not installed"
+        return 0
+    fi
+
+    uci set "${UCI_CFG}.settings.vnstat_db=1"
+    uci commit "$UCI_CFG" || { log "ERROR uci commit failed"; return 1; }
+
+    local tag="dashboard_vnstat_db_backup"
+    mkdir -p /etc/crontabs
+    touch /etc/crontabs/root
+    if ! grep -qF "$tag" /etc/crontabs/root 2>/dev/null; then
+        echo "0 */12 * * * /usr/sbin/dashboard_monitor _cron_run scheduled  # ${tag}" >> /etc/crontabs/root
+        /etc/init.d/cron reload 2>/dev/null || true
+        log "Cron job added — backup every 12 h"
+    else
+        log "Cron job already present"
+    fi
+
+    log "vnstat DB backup enabled"
+}
+
+vnstat_backup_disable() {
+    if ! command -v vnstatd > /dev/null 2>&1 || [ ! -f /etc/init.d/vnstat ]; then
+        echo "vnstat is not installed"
+        return 0
+    fi
+
+    /usr/sbin/dashboard_monitor _cron_run final 2>/dev/null || true
+
+    uci set "${UCI_CFG}.settings.vnstat_db=0"
+    uci commit "$UCI_CFG" || { log "ERROR uci commit failed"; return 1; }
+
+    local tag="dashboard_vnstat_db_backup"
+    if grep -qF "$tag" /etc/crontabs/root 2>/dev/null; then
+        sed -i "/${tag}/d" /etc/crontabs/root
+        /etc/init.d/cron reload 2>/dev/null || true
+    fi
+
+    log "vnstat DB backup disabled"
+}
+
+vnstat_backup_fix() {
+    if ! command -v vnstatd > /dev/null 2>&1 || [ ! -f /etc/init.d/vnstat ]; then
+        echo "vnstat is not installed"
+        return 0
+    fi
+    if [ "$(uci get ${UCI_CFG}.settings.vnstat_db 2>/dev/null)" = "1" ]; then
+        local tag="dashboard_vnstat_db_backup"
+        if ! grep -qF "$tag" /etc/crontabs/root 2>/dev/null; then
+            echo "0 */12 * * * /usr/sbin/dashboard_monitor _cron_run scheduled  # ${tag}" >> /etc/crontabs/root
+            /etc/init.d/cron reload 2>/dev/null || true
+            log "Cron job added"
+        else
+            log "Cron job already present"
+        fi
+    else
+        log "vnstat DB backup not enabled, skipping"
+    fi
+}
+
+vnstat_backup() {
+    if ! command -v vnstatd > /dev/null 2>&1 || [ ! -f /etc/init.d/vnstat ]; then
+        echo "vnstat is not installed"
+        return 0
+    fi
+    /usr/sbin/dashboard_monitor _cron_run "${1:-manual}"
+}
+
+vnstat_restore() {
+    if ! command -v vnstatd > /dev/null 2>&1 || [ ! -f /etc/init.d/vnstat ]; then
+        echo "vnstat is not installed"
+        return 0
+    fi
+    /usr/sbin/dashboard_monitor _init
+}
+
+# status
+
+status_service() {
+    echo "=== $NAME status ==="
+
+    if [ -f "/etc/rc.d/S${START}${NAME}" ]; then
+        echo "  Boot:             enabled"
+    else
+        echo "  Boot:             disabled"
+    fi
+
+    local running="no"
+    if [ -f /tmp/dashboard/daemon.pid ]; then
+        local pid
+        pid=$(cat /tmp/dashboard/daemon.pid 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            running="yes"
+        fi
+    fi
+    echo "  Running:          $running"
+
+    echo ""
+    local vn_val
+    vn_val="$(uci  get ${UCI_CFG}.settings.vnstat  2>/dev/null)"
+    [ "$vn_val"  = "0" ] && echo "  vnStat card:      disabled" \
+                          || echo "  vnStat card:      enabled"
+
+    echo ""
+    echo "  ── vnstat DB backup ──────────────────────────────────"
+
+    if ! command -v vnstatd > /dev/null 2>&1 || [ ! -f /etc/init.d/vnstat ]; then
+        echo "  vnstat installed: no"
+        echo "  vnstat DB backup: N/A"
+    else
+        echo "  vnstat installed: yes"
+        local db_val
+        db_val="$(uci get ${UCI_CFG}.settings.vnstat_db 2>/dev/null)"
+        [ "$db_val" = "1" ] && echo "  vnstat DB backup: enabled" \
+                             || echo "  vnstat DB backup: disabled"
+
+        local bk_ts
+        bk_ts=$(cat /etc/vnstat/backup/last_backup_ts 2>/dev/null)
+        if [ -n "$bk_ts" ] && [ "$bk_ts" -gt 0 ] 2>/dev/null; then
+            echo "  Last backup:      $(date -d @"$bk_ts" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$bk_ts")"
+        else
+            echo "  Last backup:      never"
+        fi
+
+        if [ -f /etc/vnstat/backup/vnstat.db.gz ]; then
+            local bk_size
+            bk_size=$(du -k /etc/vnstat/backup/vnstat.db.gz 2>/dev/null | awk '{print $1}')
+            echo "  Backup file:      /etc/vnstat/backup/vnstat.db.gz  (${bk_size}KB)"
+        else
+            echo "  Backup file:      not found"
+        fi
+
+        local tag="dashboard_vnstat_db_backup"
+        if grep -qF "$tag" /etc/crontabs/root 2>/dev/null; then
+            echo "  Scheduler:        active (cron, every 12 h)"
+        else
+            echo "  Scheduler:        not scheduled"
+        fi
+    fi
+}

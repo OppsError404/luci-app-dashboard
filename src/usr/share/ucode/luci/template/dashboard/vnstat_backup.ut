@@ -1,0 +1,235 @@
+{% include('header') %}
+<link rel="stylesheet" href="/luci-static/resources/view/dashboard/vnstat_backup.css">
+
+<script>
+var DASHBOARD_SID = "{{ ctx.authsession }}";
+function ubusCall(obj, method, params) {
+  return fetch("/ubus", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0", id: 1,
+      method: "call",
+      params: [DASHBOARD_SID, obj, method, params || {}]
+    })
+  }).then(function(r) { return r.json(); }).then(function(res) {
+    if (res.result && res.result[0] === 0) return res.result[1];
+    throw new Error((res.error && res.error.message) || "ubus call failed");
+  });
+}
+function applyTheme() {
+  var mode = "dark";
+  try {
+    var stored = localStorage.getItem("__custom_theme");
+    if (stored === "light" || stored === "dark") {
+      mode = stored;
+    } else {
+      mode = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+  } catch(_) {}
+  var el = document.getElementById("vnbk");
+  if (el) {
+    el.classList.remove("theme-light", "theme-dark");
+    el.classList.add(mode === "light" ? "theme-light" : "theme-dark");
+  }
+}
+function onThemeChange(e) {
+  var stored;
+  try { stored = localStorage.getItem("__custom_theme"); } catch(_) {}
+  if (stored === "light" || stored === "dark") return;
+  var el = document.getElementById("vnbk");
+  if (el) {
+    el.classList.remove("theme-light", "theme-dark");
+    el.classList.add(e.matches ? "theme-dark" : "theme-light");
+  }
+}
+if (window.matchMedia) {
+  try {
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", onThemeChange);
+  } catch(_) {
+    try { window.matchMedia("(prefers-color-scheme: dark)").addListener(onThemeChange); } catch(__) {}
+  }
+}
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", applyTheme);
+} else {
+  applyTheme();
+}
+</script>
+
+<div id="vnbk">
+
+<div id="vnbk_modal_ovl" class="vnbk-modal-ovl">
+  <div class="vnbk-modal">
+    <h3 id="vnbk_modal_title">Confirm Action</h3>
+    <p id="vnbk_modal_msg"></p>
+    <div class="vnbk-modal-btns">
+      <button class="btn" style="background:rgba(255,255,255,0.1); color:#fff; border:1px solid rgba(255,255,255,0.15)" onclick="hideVnbkModal()">Cancel</button>
+      <button class="btn red" id="vnbk_modal_confirm">Confirm</button>
+    </div>
+  </div>
+</div>
+
+  <!-- page header -->
+  <div class="pg-head">
+    <div class="pg-head-left">
+      <h2>vnStat Database Backup</h2>
+      <p>Manage traffic history across firmware upgrades &mdash; backup to flash, restore on boot.</p>
+    </div>
+    <div class="ab-cluster" id="auto_backup_badge">
+      <div class="ab-toggle-wrap" id="ab_toggle_wrap">
+        <div class="ab-toggle-meta">
+          <span class="ab-toggle-label" id="ab_toggle_label">Auto backup</span>
+          <span class="ab-toggle-sub" id="ab_toggle_sub"><span class="ab-clock">&#128336;</span><span id="ab_toggle_interval">&mdash;</span></span>
+        </div>
+        <div class="ab-toggle" id="ab_toggle" role="switch" aria-checked="false" tabindex="0">
+          <span class="ab-knob"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- stats -->
+  <div class="stat-strip">
+
+    <div class="stat-pill">
+      <div class="sp-label">Flash backup</div>
+      <div class="sp-val miss" id="ss_backup_state">…</div>
+      <div class="sp-sub" id="ss_backup_size">—</div>
+    </div>
+
+    <div class="stat-pill">
+      <div class="sp-label">Live DB&nbsp;(/tmp)</div>
+      <div class="sp-val miss" id="ss_db_state">…</div>
+      <div class="sp-sub" id="ss_db_size">—</div>
+    </div>
+
+    <div class="stat-pill">
+      <div class="sp-label">Last backup</div>
+      <div class="sp-val dim" id="ss_last_bk">…</div>
+      <div class="sp-sub" id="ss_last_bk_trig">—</div>
+    </div>
+
+    <div class="stat-pill">
+      <div class="sp-label">Last restore</div>
+      <div class="sp-val dim" id="ss_last_rs">…</div>
+      <div class="sp-sub" id="ss_last_rs_trig">—</div>
+    </div>
+
+  </div>
+
+  <!-- quick actions -->
+  <div class="section-label">Quick actions</div>
+
+  <div class="section-grid">
+    <!-- Instant Backup -->
+    <div class="vnbk-card acc-purple">
+      <div class="card-inner">
+        <div class="card-head">
+          <div class="card-icon purple">&#128190;</div>
+          <div class="card-title">Instant Backup</div>
+        </div>
+        <p class="card-desc">
+          Compress the live vnStat database to
+          <span class="path-chip">/etc/vnstat/backup/vnstat.db.gz</span> right now.
+          Safe to run at any time &mdash; vnstatd keeps running during the backup.
+        </p>
+        <div class="card-actions">
+          <button class="btn purple" id="ibk_btn" onclick="doAction('backup', 'ibk_btn', 'ibk_result')">Backup Now</button>
+        </div>
+        <div class="result-banner" id="ibk_result"></div>
+      </div>
+      <div class="card-meta">
+        <span>Writes to: <b>/etc/vnstat/backup/vnstat.db.gz</b></span>
+        <span>vnstatd stays running</span>
+      </div>
+    </div>
+
+    <!-- Load Flash Backup -->
+    <div class="vnbk-card acc-orange">
+      <div class="card-inner">
+        <div class="card-head">
+          <div class="card-icon orange">&#10227;</div>
+          <div class="card-title">Load Flash Backup</div>
+        </div>
+        <p class="card-desc">
+          Decompress the flash backup and replace the live database in
+          <span class="path-chip">/tmp/lib/vnstat/</span>.
+          vnstatd will be stopped, the database swapped, then restarted automatically.
+        </p>
+        <div class="card-actions">
+          <button class="btn orange disabled" id="irs_btn" disabled>Loading…</button>
+        </div>
+        <div class="result-banner" id="irs_result"></div>
+      </div>
+      <div class="card-meta">
+        <span>Reads from: <b>/etc/vnstat/backup/vnstat.db.gz</b></span>
+        <span>vnstatd will restart</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- upload and download -->
+  <div class="section-label" style="margin-top:20px">Transfer</div>
+
+  <div class="section-grid">
+    <!-- Download -->
+    <div class="vnbk-card acc-blue">
+      <div class="card-inner">
+        <div class="card-head">
+          <div class="card-icon blue">&#8659;</div>
+          <div class="card-title">Download Database Backup</div>
+        </div>
+        <p class="card-desc">
+          Save <span class="path-chip">vnstat.db.gz</span> from router flash to your PC
+          before a firmware upgrade or factory reset.
+        </p>
+        <div class="card-actions" id="download_actions">
+          <a class="btn blue disabled">Loading…</a>
+        </div>
+      </div>
+      <div class="card-meta" id="download_meta" style="display:none">
+        <span>Size: <b id="cm_size">—</b></span>
+        <span>Modified: <b id="cm_mtime">—</b></span>
+        <span>Format: <b>gzip &middot; SQLite</b></span>
+      </div>
+    </div>
+    <!-- Upload & Restore -->
+    <div class="vnbk-card acc-green">
+      <div class="card-inner">
+        <div class="card-head">
+          <div class="card-icon green">&#8657;</div>
+          <div class="card-title">Upload &amp; Restore Database</div>
+        </div>
+        <p class="card-desc">
+          Upload a <span class="path-chip">vnstat.db.gz</span> from your PC to the router flash.
+          Validation is performed on upload. Use the Restore button to apply it to the live database.
+        </p>
+        <div class="upload-row">
+          <div style="position:relative; display:flex; align-items:center;">
+            <input type="file" id="upload_file" accept=".gz" onchange="onFileSelect()">
+            <button id="upload_clear" onclick="clearUpload()" title="Clear selection" 
+              style="display:none; position:absolute; right:8px; border:none; background:none; color:#ef4444; cursor:pointer; font-size:1.1rem; line-height:1; padding:0;">
+              &times;
+            </button>
+          </div>
+          <div class="card-actions" style="margin-top:0">
+            <button class="btn green disabled" id="upload_btn" onclick="doUpload()" disabled>Upload</button>
+            <button class="btn orange disabled" id="irs_btn_2" onclick="doAction('restore', 'irs_btn_2', 'upload_result')" disabled>Restore</button>
+          </div>
+        </div>
+        <div class="result-banner" id="upload_result"></div>
+      </div>
+      <div class="card-meta">
+        <span>Validated: gzip integrity + SQLite header</span>
+        <span>Storage free: <b>/tmp: <span id="tmp_free_kb">…</span></b> &middot; <b>Flash: <span id="flash_free_kb">…</span></b></span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script src="/luci-static/resources/view/dashboard/vnstat_backup.js"></script>
+
+{% include('footer') %}
