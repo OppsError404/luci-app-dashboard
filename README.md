@@ -11,7 +11,7 @@ Real-time system monitoring dashboard and vnStat database backup manager for Ope
 ### For OpenWrt v25.12 or newer (.apk)
 
 ```bash
-apk update && \wget --no-check-certificate -O /tmp/luci-app-dashboard.apk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v2.0.0-r5/luci-app-dashboard-2.0.0-r5.apk" && \
+apk update && \wget --no-check-certificate -O /tmp/luci-app-dashboard.apk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v2.0.0-r6/luci-app-dashboard-2.0.0-r6.apk" && \
 apk add --allow-untrusted /tmp/luci-app-dashboard.apk && \
 rm -f /tmp/luci-app-dashboard.apk
 ```
@@ -19,7 +19,7 @@ rm -f /tmp/luci-app-dashboard.apk
 ### For OpenWrt v24.10.5 or older (.ipk)
 
 ```bash
-opkg update && \wget --no-check-certificate -O /tmp/luci-app-dashboard.ipk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v2.0.0-r5/luci-app-dashboard_2.0.0-r5.ipk" && \
+opkg update && \wget --no-check-certificate -O /tmp/luci-app-dashboard.ipk "https://github.com/OppsError404/luci-app-dashboard/releases/download/v2.0.0-r6/luci-app-dashboard_2.0.0-r6.ipk" && \
 opkg install /tmp/luci-app-dashboard.ipk && \
 rm -f /tmp/luci-app-dashboard.ipk
 ```
