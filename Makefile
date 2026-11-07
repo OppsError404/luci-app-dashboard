@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-dashboard
 PKG_VERSION:=2.0.0
-PKG_RELEASE:=5
+PKG_RELEASE:=6
 PKG_LICENSE:=MIT-License
 PKG_MAINTAINER:=Mahid
 PKG_URL:=https://github.com/OppsError404/luci-app-dashboard
