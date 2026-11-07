@@ -189,6 +189,117 @@ local function clear_persistent_key(key)
   if payload then write_file_atomic(PERSIST_FILE, payload) end
 end
 
+-- Internet timeouts must not hold up CPU, traffic counters or the heartbeat.
+-- Keep at most one worker per key and only read its result after it exits.
+-- Only the parent updates cache.json, so workers cannot overwrite each other.
+local workers = {}
+local worker_sequence = 0
+
+local function cleanup_worker(worker)
+  if worker.keepalive then
+    worker.keepalive:close()
+    worker.keepalive = nil
+  end
+  os.remove(worker.path)
+  os.remove(worker.path .. ".tmp")
+end
+
+local function cancel_worker(key)
+  local worker = workers[key]
+  if not worker then return end
+  -- The child has its own session, including any ping/fetch subprocesses.
+  nixio.kill(-worker.pid, 9)
+  nixio.kill(worker.pid, 9)
+  nixio.waitpid(worker.pid)
+  cleanup_worker(worker)
+  workers[key] = nil
+end
+
+local function cancel_workers()
+  for key in pairs(workers) do cancel_worker(key) end
+end
+
+local function run_worker(fn, path, reader, writer)
+  writer:close()
+  -- Other workers must not keep the parent's pipe ends alive after it exits.
+  for _, active in pairs(workers) do
+    if active.keepalive then active.keepalive:close() end
+  end
+  if not nixio.setsid() then return false end
+  if conn then pcall(function() conn:close() end) end
+
+  local worker_pid = nixio.getpid()
+  if worker_pid <= 1 then return false end
+  local guardian = nixio.fork()
+  if guardian == 0 then
+    -- EOF follows parent termination as well as normal worker cleanup.
+    -- Cancel the entire session so inherited daemon locks are also released.
+    reader:read(1)
+    nixio.kill(worker_pid, 9)
+    os.remove(path .. ".tmp")
+    os.remove(path)
+    nixio.kill(-worker_pid, 9)
+    os.exit(0)
+  elseif not guardian then
+    return false
+  end
+  reader:close()
+  local data = fn()
+  local payload = type(data) == "table" and jsonc.stringify(data)
+  return payload and write_file_atomic(path, payload)
+end
+
+local function async_cached(key, ttl, fn, fallback)
+  if not (nixio_ok and nixio.fork and nixio.pipe and has_jsonc) then
+    return cache[key] and cache[key].data or fallback
+  end
+
+  local worker = workers[key]
+  if worker then
+    local pid, status, code = nixio.waitpid(worker.pid, "nohang")
+    if pid == worker.pid then
+      local raw = read_file(worker.path)
+      cleanup_worker(worker)
+      workers[key] = nil
+      local data = raw and jsonc.parse(raw)
+      if status == "exited" and code == 0 and type(data) == "table" then
+        local entry = { ts = worker.started, data = data }
+        cache[key] = entry
+        if PERSIST_TTL[key] then save_persistent_cache(key, entry) end
+      end
+    elseif pid == nil then
+      cleanup_worker(worker)
+      workers[key] = nil
+    end
+  end
+
+  local now = os_time()
+  local entry = cache[key]
+  if not workers[key] and (not entry or now - entry.ts >= ttl) then
+    worker_sequence = worker_sequence + 1
+    local path = "/tmp/dashboard/." .. key .. ".worker."
+      .. tostring(nixio.getpid()) .. "." .. tostring(worker_sequence) .. ".json"
+    os.remove(path)
+    os.remove(path .. ".tmp")
+    local reader, writer = nixio.pipe()
+    if not reader then return entry and entry.data or fallback end
+    local pid = nixio.fork()
+    if pid == 0 then
+      -- A startup error must exit the child, not unwind into the daemon loop.
+      local ok, written = pcall(run_worker, fn, path, reader, writer)
+      os.exit(ok and written and 0 or 1)
+    end
+    reader:close()
+    if pid then
+      workers[key] = { pid = pid, path = path, started = now, keepalive = writer }
+    else
+      writer:close()
+    end
+  end
+
+  return entry and entry.data or fallback
+end
+
 local function list_dir(path, nofork)
   if not path then return {} end
   if nixio_fs and nixio_fs.dir then
@@ -473,7 +584,6 @@ end
 
 -- ping without forking
 local NIXIO_PING_OK = nixio_ok and nixio.gettimeofday and nixio.bit and true or false
-local NIXIO_PING_VERIFIED = false
 
 local function nixio_ping(host, timeout_sec)
   if not NIXIO_PING_OK then return nil end
@@ -485,9 +595,7 @@ local function nixio_ping(host, timeout_sec)
     return nil
   end
 
-  sock:setsockopt("socket", "rcvtimeo", timeout_sec or 2, 0)
-
-  local id = (nixio.getpid and nixio.getpid()) or 1
+  local id = bit.band((nixio.getpid and nixio.getpid()) or 1, 0xFFFF)
   local seq = 1
   local payload = string.rep("x", 16)
 
@@ -517,74 +625,78 @@ local function nixio_ping(host, timeout_sec)
   local sec1, usec1 = nixio.gettimeofday()
   local sent = sock:sendto(pkt, host, 0)
   if not sent then
+    NIXIO_PING_OK = false
     sock:close()
     return nil
   end
 
-  local resp = sock:recv(1024)
-  local sec2, usec2 = nixio.gettimeofday()
-  sock:close()
-
-  if not resp or #resp < 28 then return nil end
-
-  local ihl = bit.band(resp:byte(1), 0x0F) * 4
-  if ihl < 20 or #resp < ihl + 8 then return nil end
-
-  if resp:byte(ihl + 1) ~= 0 then return nil end
-
-  local resp_id = resp:byte(ihl + 5) * 256 + resp:byte(ihl + 6)
-  if resp_id ~= id then return nil end
-
-  return ((sec2 - sec1) * 1000) + ((usec2 - usec1) / 1000)
-end
-
--- ping, cached for 2s
-local function get_ping_status(now, wan_iface, fast)
-  -- fast mode, one host and a 1s timeout so we get an answer right away.
-  -- not cached, the next full round pings both hosts the normal way.
-  if fast then
-    local result = { status = "offline", rtt_ms = nil }
-    if NIXIO_PING_OK then
-      local rtt = nixio_ping(PING_HOSTS[1], 1)
-      if rtt then
-        NIXIO_PING_VERIFIED = true
-        result.status = "online"
-        result.rtt_ms = tonumber(string.format("%.1f", rtt))
-      end
+  local deadline = sec1 + usec1 / 1000000 + (timeout_sec or 2)
+  while true do
+    local remaining = deadline - wall_time()
+    if remaining <= 0 then break end
+    local sec = math_floor(remaining)
+    local usec = math.max(1, math_floor((remaining - sec) * 1000000))
+    if not sock:setsockopt("socket", "rcvtimeo", sec, usec) then
+      NIXIO_PING_OK = false
+      break
     end
-    return result
-  end
+    local resp = sock:recv(1024)
+    if not resp then break end
 
-  return cached("ping", REFRESH.PING, function()
-    local result = { status = "offline", rtt_ms = nil }
-
-    if NIXIO_PING_OK then
-      for _, host in ipairs(PING_HOSTS) do
-        local rtt = nixio_ping(host, 2)
-        if rtt then
-          NIXIO_PING_VERIFIED = true
-          result.status = "online"
-          result.rtt_ms = tonumber(string.format("%.1f", rtt))
-          return result
+    -- Raw sockets also receive outgoing requests and unrelated ICMP traffic.
+    if #resp >= 28 then
+      local ihl = bit.band(resp:byte(1), 0x0F) * 4
+      if ihl >= 20 and #resp >= ihl + 8
+         and resp:byte(ihl + 1) == 0 and resp:byte(ihl + 2) == 0 then
+        local resp_id = resp:byte(ihl + 5) * 256 + resp:byte(ihl + 6)
+        local resp_seq = resp:byte(ihl + 7) * 256 + resp:byte(ihl + 8)
+        if resp_id == id and resp_seq == seq then
+          local sec2, usec2 = nixio.gettimeofday()
+          sock:close()
+          return ((sec2 - sec1) * 1000) + ((usec2 - usec1) / 1000)
         end
       end
-      if NIXIO_PING_VERIFIED then
+    end
+  end
+  sock:close()
+  return nil
+end
+
+-- Ping runs in a worker even during the initial fast collections.
+local function probe_ping_status(wan_iface)
+  local result = { status = "offline", rtt_ms = nil }
+
+  if NIXIO_PING_OK then
+    for _, host in ipairs(PING_HOSTS) do
+      local rtt = nixio_ping(host, 1)
+      if rtt then
+        result.status = "online"
+        result.rtt_ms = tonumber(string.format("%.1f", rtt))
         return result
       end
     end
+    -- A working raw socket timing out means offline, not unsupported.
+    -- Do not repeat both timed-out probes through the shell fallback.
+    if NIXIO_PING_OK then return result end
+  end
 
-    local iface_flag = (wan_iface and wan_iface ~= "") and ("-I " .. wan_iface .. " ") or ""
-    for _, host in ipairs(PING_HOSTS) do
-      local out = sys.exec("ping " .. iface_flag .. "-c1 -W2 " .. host .. " 2>/dev/null") or ""
-      local rtt = out:match("min/avg/max[^=]*=%s*[%d.]+/([%d.]+)/")
-      if rtt then
-        result.status = "online"
-        result.rtt_ms = tonumber(rtt)
-        break
-      end
+  local iface_flag = (wan_iface and wan_iface ~= "") and ("-I " .. wan_iface .. " ") or ""
+  for _, host in ipairs(PING_HOSTS) do
+    local out = sys.exec("ping " .. iface_flag .. "-c1 -W1 " .. host .. " 2>/dev/null") or ""
+    local rtt = out:match("min/avg/max[^=]*=%s*[%d.]+/([%d.]+)/")
+    if rtt then
+      result.status = "online"
+      result.rtt_ms = tonumber(rtt)
+      break
     end
-    return result
-  end)
+  end
+  return result
+end
+
+local function get_ping_status(now, wan_iface)
+  return async_cached("ping", REFRESH.PING, function()
+    return probe_ping_status(wan_iface)
+  end, { status = "offline", rtt_ms = nil, pending = true })
 end
 
 -- uptimes and wan status, cached for 10s
@@ -1187,16 +1299,18 @@ local function get_network_info(now, inet_status)
   -- only when the status really changed, on a fresh start the status is
   -- still nil and we do not want to throw the saved cache away.
   if _last_net_status ~= nil and _last_net_status ~= inet_status then
+    cancel_worker("network")
     clear_persistent_key("network")
   end
   _last_net_status = inet_status
 
   -- offline, just return the placeholder and do not save it
   if inet_status ~= "online" then
+    cancel_worker("network")
     return { public_ipv4="-", public_ipv6="-", isp_name="-", isp_asn="" }
   end
 
-  local result = cached("network", REFRESH.NETWORK, function()
+  local result = async_cached("network", REFRESH.NETWORK, function()
     local ip, isp, asn, ipv6 = "-", "-", "", "-"
 
     -- uclient-fetch is on the router already, it has no --interface flag
@@ -1234,7 +1348,7 @@ local function get_network_info(now, inet_status)
 
     local data = { public_ipv4=ip, public_ipv6=ipv6, isp_name=isp, isp_asn=asn }
     return data
-  end)
+  end, { public_ipv4="-", public_ipv6="-", isp_name="-", isp_asn="" })
 
   -- do not keep a failed lookup, clear it so we try again next round
   if result.public_ipv4 == "-" then
@@ -1401,6 +1515,7 @@ end
 
 -- close the ubus connection
 function close()
+  cancel_workers()
   if conn then
     pcall(function() conn:close() end)
     conn = nil
@@ -1409,13 +1524,14 @@ end
 
 -- drop all the cached values
 function clear_cache()
+  cancel_workers()
   cache = {}
   os.remove(PERSIST_FILE)
 end
 
 -- get all the numbers and return them
 -- the daemon calls this every 2s and the table is what the frontend gets.
--- with fast set we leave out the slow stuff (ping, isp lookup, vnstat) and
+-- with fast set we leave out the slow stuff (isp lookup, vnstat) and
 -- put placeholders in, so the first file is written right away
 function collect(fast)
   local now = os_time()
@@ -1435,15 +1551,18 @@ function collect(fast)
   local wan_l3_device   = uptimes.wan_l3_device or ""
   local wan_phys_device = uptimes.wan_phys_device or ""
 
-  -- ping, in fast mode it is one host with a 1s timeout
-  local ok_p, ping = pcall(get_ping_status, now, wan_l3_device, fast)
+  -- Pending internet probes never block the local measurements.
+  local ok_p, ping = pcall(get_ping_status, now, wan_l3_device)
   if not ok_p then ping = { status="offline", rtt_ms=nil } end
   local inet_status = ping.status or "offline"
 
   -- ip, isp and asn, skipped in fast mode
   local netinfo
-  if fast then
-    netinfo = { public_ipv4="-", public_ipv6="-", isp_name="-", isp_asn="" }
+  if fast or ping.pending then
+    -- An unfinished first probe is not an offline transition. Preserve the
+    -- saved ISP cache until we have a real connectivity result.
+    netinfo = not fast and cache.network and cache.network.data
+      or { public_ipv4="-", public_ipv6="-", isp_name="-", isp_asn="" }
   else
     local ok_n, ni = pcall(get_network_info, now, inet_status)
     if not ok_n then
@@ -1521,8 +1640,9 @@ function collect(fast)
     wifi           = clients_mem.wifi,
     lan            = clients_mem.lan,
     vnstat         = show_vnstat
-                     and { installed = vnstat_installed, ifaces = vn_all.ifaces, data = vn_all.data }
-                     or  { disabled = true },
+                     and { installed = vnstat_installed, pending = vnstat_installed and not not fast,
+                           ifaces = vn_all.ifaces, data = vn_all.data }
+                     or  { disabled = true, pending = false },
     device         = device,
     client_monitor = client_monitor,
     network        = {

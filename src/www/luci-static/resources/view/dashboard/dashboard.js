@@ -630,17 +630,31 @@
       });
     }
     function markFresh() {
+      const realtime = window.CustomRealtime;
+      if (realtime && realtime._initialLoadingTimer != null) {
+        clearTimeout(realtime._initialLoadingTimer);
+        realtime._initialLoadingTimer = null;
+      }
       const overlay = document.getElementById("dashboard_loading_overlay");
+      const onDone = () => {
+        if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        if (realtime && realtime._initialLoading) {
+          realtime._initialLoading = false;
+          if (realtime._vnstatReady && realtime.lastVnstatData && !realtime.lastVnstatData.disabled) {
+            realtime.renderVnstatData(realtime.lastVnstatData);
+          }
+        }
+      };
       if (overlay) {
+        if (overlay.classList.contains("dlo_hidden")) return;
         overlay.classList.add("dlo_hidden");
         // take the overlay out of the dom after the fade so it does not
         // block clicks later
-        const onDone = () => {
-          if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
-        };
         overlay.addEventListener("transitionend", onDone, { once: true });
         // in case transitionend never fires
         setTimeout(onDone, 500);
+      } else {
+        onDone();
       }
       STALE_IDS.forEach((id) => {
         const el = document.getElementById(id);
@@ -732,6 +746,9 @@
       _bypassMinDelta: false,
       _firstFetchDone: false,
       _firstDeltaReady: false,
+      _initialLoading: true,
+      _initialLoadingTimer: null,
+      _vnstatReady: false,
       _consecutiveErrors: 0,
       _lastErrorTime: 0,
       _errorLogged: false,
@@ -1013,7 +1030,8 @@
         });
       },
 
-      _showVnstatWarning(warnEl, contentEl, dropdown, menu, trigger, labelEl, cls, html) {
+      _showVnstatWarning(warnEl, contentEl, dropdown, menu, trigger, labelEl, cls, html, pending = false) {
+        const loading = this._initialLoading || pending;
         if (menu) menu.innerHTML = "";
         if (labelEl) labelEl.textContent = "";
         if (dropdown) {
@@ -1022,11 +1040,11 @@
         }
         if (trigger) trigger.setAttribute("aria-expanded", "false");
         if (warnEl) {
-          warnEl.className = "vnstat_warn " + cls;
-          warnEl.innerHTML = html;
-          warnEl.style.display = "flex";
+          warnEl.className = loading ? "vnstat_warn" : "vnstat_warn " + cls;
+          warnEl.innerHTML = loading ? "" : html;
+          warnEl.style.display = loading ? "none" : "flex";
         }
-        if (contentEl) contentEl.style.display = "none";
+        if (contentEl) contentEl.style.display = loading ? "" : "none";
       },
 
       renderVnstatData(vnstat) {
@@ -1039,6 +1057,14 @@
         const menu = document.getElementById("vn_iface_menu");
         const trigger = document.getElementById("vn_iface_trigger");
         const labelEl = document.getElementById("vn_iface_label");
+
+        if (vnstat.pending === true) {
+          this._showVnstatWarning(
+            warnEl, contentEl, dropdown, menu, trigger, labelEl,
+            "", "", true,
+          );
+          return;
+        }
 
         const installed = vnstat.installed !== false;
         if (!installed) {
@@ -2039,11 +2065,14 @@
           }
 
           const vn = data?.vnstat;
+          const vnVisibilityChanged = vn &&
+            (vn.disabled === true) !== (this.lastVnstatData?.disabled === true);
           const vnPending =
             vn &&
-            vn.installed === true &&
-            Array.isArray(vn.ifaces) &&
-            vn.ifaces.length === 0;
+            (vn.pending === true ||
+              (vn.installed === true &&
+                Array.isArray(vn.ifaces) &&
+                vn.ifaces.length === 0));
 
           // show/hide is checked on every fetch so a toggle change is
           // picked up right away even if the details are only redrawn
@@ -2064,15 +2093,19 @@
           if (
             initial ||
             vnPending ||
+            vnVisibilityChanged ||
+            !this._vnstatReady ||
             now - (this.lastUpdate.vnstat || 0) >=
               this.config.vnstatUpdateInterval
           ) {
             // only throttle when we have real data (or we know vnstat is
             // not installed), otherwise keep trying every cycle
-            if (!vnPending) this.lastUpdate.vnstat = now;
+            if (vn) {
+              this._vnstatReady = vn.pending !== true;
+              this.lastVnstatData = vn;
+            }
+            if (vn && !vnPending) this.lastUpdate.vnstat = now;
             if (data?.vnstat && data?.vnstat?.disabled !== true) {
-                this.lastVnstatData = data.vnstat;
-
                 const rawIfaces = Array.isArray(data.vnstat.ifaces)
                   ? data.vnstat.ifaces
                   : [];
@@ -2132,7 +2165,7 @@
             }
           }
 
-          if (pending.length) {
+          if (pending.length || (this._initialLoading && this._firstDeltaReady && this._vnstatReady)) {
             /* use setTimeout(0), requestAnimationFrame does not run in a
                background tab and some LuCI iframes report hidden wrong */
              setTimeout(() => {
@@ -2143,6 +2176,7 @@
                    console.warn("pending write failed at index " + i + ":", e);
                  }
                });
+               if (this._initialLoading && this._firstDeltaReady && this._vnstatReady) markFresh();
              }, 0);
           }
         } catch (e) {
@@ -2216,18 +2250,19 @@
         } catch (_) {}
 
         // remove the overlay after 8s even if the deltas never show up
-        const _overlaySafety = setTimeout(() => markFresh(), 8000);
+        this._initialLoadingTimer = setTimeout(() => markFresh(), 8000);
 
-        // second fetch gives us the first real cpu% and wan speed, only
-        // then we drop the overlay
+        // Wait for real deltas and a completed usage result, not the fast
+        // snapshot's empty placeholders. The safety timeout remains bounded.
         const _tryDismiss = () => {
-          clearTimeout(_overlaySafety);
-          if (this._firstDeltaReady) {
+          if (!this._initialLoading) return;
+          if (this._firstDeltaReady && this._vnstatReady) {
             markFresh();
           } else {
             setTimeout(() => {
+              if (!this._initialLoading) return;
               this._bypassMinDelta = true;
-              this.update(false, true).finally(() => markFresh());
+              this.update(false, true);
             }, 1000);
           }
         };
