@@ -543,11 +543,8 @@
   gap: 7px;
   box-sizing: border-box;
   border-radius: 6px;
-  border: 1px solid rgba(78,168,255,0.22);
-  background: rgba(78,168,255,0.07);
-  color: #4ea8ff;
+  border: 1px solid transparent;
   font-size: 0.72rem;
-  transition: background 0.12s, border-color 0.12s;
 }
 .wan_client_btn {
   gap: 6px;
@@ -570,22 +567,12 @@
   letter-spacing: 0.2px;
   transition: background 0.15s, border-color 0.15s, color 0.15s;
 }
-.csp_backup_btn:hover {
-  background: rgba(78,168,255,0.14);
-  border-color: rgba(78,168,255,0.40);
-  color: #74b9ff;
-}
 .csp_backup_btn i { font-size: 0.72rem; opacity: 0.75; }
 
-.theme-light .csp_backup_btn,
 .theme-light .wan_client_btn {
   border-color: rgba(24,96,170,0.25);
   background: rgba(24,96,170,0.07);
   color: #1860aa;
-}
-.theme-light .csp_backup_btn:hover {
-  background: rgba(24,96,170,0.14);
-  border-color: rgba(24,96,170,0.40);
 }
 
 /* DB backup status row */
@@ -739,10 +726,18 @@
   text-decoration: none;
   cursor: pointer;
   border: 1px solid transparent;
-  transition: background 0.15s, border-color 0.15s, opacity 0.15s, transform 0.1s;
   white-space: nowrap;
   line-height: 1.4;
   user-select: none;
+}
+#settings_panel .csp_backup_btn,
+#settings_panel .csp_update_btn {
+  box-shadow: none;
+  transition: background 0.15s, border-color 0.15s, opacity 0.15s, transform 0.1s;
+}
+#settings_panel a.csp_backup_btn,
+#settings_panel a.csp_update_btn {
+  text-decoration: none;
 }
 .csp_update_btn:active {
   transform: scale(0.97);
@@ -753,154 +748,52 @@
 .csp_update_btn.hidden {
   display: none;
 }
-.csp_update_btn_check {
-  border-color: rgba(78,168,255,0.35);
-  background: rgba(78,168,255,0.1);
-  color: #4ea8ff;
-}
-.csp_update_btn_check:hover {
-  background: rgba(78,168,255,0.18);
-  border-color: rgba(78,168,255,0.55);
-  color: #6ab8ff;
-}
 .csp_update_btn_check.busy i {
   animation: dlo_rotate 1s linear infinite;
 }
-.csp_update_btn_download {
-  border-color: rgba(40,167,69,0.4);
-  background: rgba(40,167,69,0.12);
-  color: #28a745;
-}
-.csp_update_btn_download:hover {
-  background: rgba(40,167,69,0.22);
-  border-color: rgba(40,167,69,0.6);
-  color: #34c759;
-}
+.csp_backup_btn,
+.csp_update_btn_check,
 .csp_update_btn_release,
-.csp_update_btn_copy {
+.csp_update_btn_upgrade {
   border-color: rgba(255,255,255,0.14);
   background: rgba(255,255,255,0.06);
   color: rgba(255,255,255,0.65);
 }
-.csp_update_btn_release:hover,
-.csp_update_btn_copy:hover {
+#settings_panel .csp_backup_btn:hover,
+#settings_panel .csp_update_btn:hover {
   background: rgba(255,255,255,0.12);
-  border-color: rgba(255,255,255,0.28);
+  /* Override LuCI's forced blue native-button hover border. */
+  border-color: rgba(255,255,255,0.28) !important;
   color: rgba(255,255,255,0.85);
 }
+.theme-light .csp_backup_btn,
+.theme-light .csp_update_btn_check,
 .theme-light .csp_update_btn_release,
-.theme-light .csp_update_btn_copy {
+.theme-light .csp_update_btn_upgrade {
   border-color: rgba(0,0,0,0.14);
   background: rgba(0,0,0,0.05);
   color: rgba(0,0,0,0.6);
 }
-.theme-light .csp_update_btn_release:hover,
-.theme-light .csp_update_btn_copy:hover {
+.theme-light #settings_panel .csp_backup_btn:hover,
+.theme-light #settings_panel .csp_update_btn:hover {
   background: rgba(0,0,0,0.1);
-  border-color: rgba(0,0,0,0.25);
+  border-color: rgba(0,0,0,0.25) !important;
   color: rgba(0,0,0,0.8);
 }
-.csp_update_btn_copy.copied {
-  border-color: rgba(40,167,69,0.6);
-  background: rgba(40,167,69,0.18);
-  color: #34c759;
-}
-.theme-light .csp_update_btn_copy.copied {
-  border-color: rgba(40,167,69,0.6);
-  background: rgba(40,167,69,0.15);
-  color: #1e8e3e;
-}
-.csp_update_btn_download.hidden,
-.csp_update_btn_release.hidden,
-.csp_update_btn_copy.hidden {
+.csp_update_btn_release.hidden {
   display: none !important;
 }
-.update_toast {
-  position: fixed;
-  bottom: 20px;
-  right: 20px;
-  z-index: 10000;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 280px;
-  max-width: 360px;
-  padding: 14px 16px;
-  border-radius: 10px;
-  background: rgba(30,30,34,0.96);
-  color: rgba(255,255,255,0.92);
-  box-shadow: 0 8px 28px rgba(0,0,0,0.45);
-  border: 1px solid rgba(255,255,255,0.08);
-  font-size: 0.82rem;
-  opacity: 0;
-  transform: translateY(12px);
-  transition: opacity 0.25s ease, transform 0.25s ease;
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
+.csp_update_note {
+  margin-top: 4px;
+  font-size: 0.65rem;
+  line-height: 1.4;
+  color: rgba(255,255,255,0.55);
 }
-.update_toast.show {
-  opacity: 1;
-  transform: translateY(0);
+.theme-light .csp_update_note {
+  color: rgba(0,0,0,0.55);
 }
-.update_toast_icon {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  background: rgba(40,167,69,0.18);
-  color: #34c759;
-}
-.update_toast_icon .icon {
-  width: 16px;
-  height: 16px;
-  fill: currentColor;
-}
-.update_toast_body {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-.update_toast_title {
-  font-weight: 700;
-  font-size: 0.85rem;
-  margin-bottom: 2px;
-}
-.update_toast_msg {
-  font-size: 0.76rem;
-  color: rgba(255,255,255,0.62);
-  line-height: 1.35;
-}
-.update_toast_close {
-  flex: 0 0 auto;
-  background: none;
-  border: none;
-  color: rgba(255,255,255,0.45);
-  font-size: 1.3rem;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0 2px;
-  transition: color 0.15s;
-}
-.update_toast_close:hover {
-  color: rgba(255,255,255,0.85);
-}
-.theme-light .update_toast {
-  background: rgba(255,255,255,0.97);
-  color: rgba(0,0,0,0.85);
-  border-color: rgba(0,0,0,0.08);
-  box-shadow: 0 8px 28px rgba(0,0,0,0.18);
-}
-.theme-light .update_toast_msg,
 .theme-light .mem_spark_label,
 .theme-light .cpu-core-label { color: rgba(0,0,0,0.55); }
-.theme-light .update_toast_close {
-  color: rgba(0,0,0,0.4);
-}
-.theme-light .update_toast_close:hover {
-  color: rgba(0,0,0,0.8);
-}
 /* Settings button badge for cron mismatch warning */
 #settings_btn .badge-dot {
   position: absolute;
@@ -2152,6 +2045,16 @@ a.model_widget:hover {
   flex-shrink: 0;
   font-size: 7px;
 }
+.cl_port_dot_wan.wan_pending {
+  background: rgba(255,255,255,0.09);
+  border: 1px solid rgba(255,255,255,0.05);
+  color: rgba(255,255,255,0.55);
+}
+.theme-light .cl_port_dot_wan.wan_pending {
+  background: rgba(0,0,0,0.09);
+  border-color: rgba(0,0,0,0.10);
+  color: rgba(0,0,0,0.50);
+}
 .cl_port_dot_wan.wan_online {
   background: rgba(33,150,243,0.70);
   border: 1px solid rgba(33,150,243,0.50);
@@ -2403,13 +2306,6 @@ a.model_widget:hover {
     padding: 1px 5px !important;
     font-size: 0.7rem !important;
     margin-top: 2px !important;
-  }
-  .update_toast {
-    left: 12px;
-    right: 12px;
-    bottom: 12px;
-    max-width: none;
-    min-width: 0;
   }
   .csp_update_actions {
     flex-direction: column;

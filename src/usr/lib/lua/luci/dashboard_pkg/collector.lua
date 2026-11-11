@@ -51,7 +51,6 @@ local REFRESH = {
   CLIENTS = 20,
   UPTIME  = 10,
   VNSTAT  = 300,
-  DEVICE  = 3600,
   NETWORK = 43200,
   BINARY  = 3600,
   -- the client monitor check is cheap now, so it can run more often
@@ -65,7 +64,7 @@ local PERSIST_FILE = "/tmp/dashboard/cache.json"
 local PERSIST_TTL = {
   network        = REFRESH.NETWORK,
   vnstat_all     = REFRESH.VNSTAT,
-  device         = REFRESH.DEVICE,
+  device         = math.huge, -- invalidated by force refresh or service restart
   vnstat_bin     = REFRESH.BINARY,
   client_monitor = REFRESH.CLIENT_MONITOR,
 }
@@ -1358,38 +1357,94 @@ local function get_network_info(now, inet_status)
   return result
 end
 
--- device info, the router model, cached for 1h
+-- Device-tree strings may contain NUL terminators. Blank/placeholder values
+-- must not stop the next source from supplying a usable model.
+local function model_name(value)
+  if type(value) ~= "string" then return nil end
+  value = value:gsub("[%c%s]+", " "):match("^%s*(.-)%s*$")
+  local lower = value:lower()
+  if value == "" or value == "-" or value == "--" or lower == "unknown"
+      or lower == "n/a" or lower == "not specified" or lower == "default string"
+      or lower == "system product name" or lower == "to be filled by o.e.m." then
+    return nil
+  end
+  return value
+end
+
+-- Reuse usable identities until explicitly invalidated, not failed lookups.
 local function get_device_info(c)
-  return cached("device", REFRESH.DEVICE, function()
-    local model = ""
+  local entry = cache.device
+  local saved = entry and type(entry.data) == "table" and model_name(entry.data.model)
+  if saved then
+    return { model = saved }
+  end
 
-    -- the board object has the marketing name of the device
-    if c then
-      local ok_b, board = pcall(c.call, c, "system", "board", {})
-      if ok_b and type(board) == "table" and type(board.model) == "string" then
-        model = board.model
-      end
+  local model
+  local board, board_model
+
+  -- the board object has the marketing name of the device
+  if c then
+    local ok_b, data = pcall(c.call, c, "system", "board", {})
+    if ok_b and type(data) == "table" then
+      board = data
+      model = model_name(data.model)
     end
+  end
 
-    -- fallback for the odd build without the board object
-    if model == "" then
-      local raw = read_file("/tmp/sysinfo/model")
-      if raw then model = (raw:gsub("%s+$", "")) end
+  -- fallback for the odd build without the board object
+  if not model then
+    model = model_name(read_file("/tmp/sysinfo/model"))
+  end
+
+  -- board detection also saves the model in the persistent board description.
+  if not model and has_jsonc then
+    local raw = read_file("/etc/board.json")
+    local ok_b, data = pcall(jsonc.parse, raw or "")
+    if ok_b and type(data) == "table" and type(data.model) == "table" then
+      board_model = data.model
+      model = model_name(board_model.name)
     end
+  end
 
-    if model == "" and c then
-      local ok_s, sysinfo = pcall(c.call, c, "system", "info", {})
-      if ok_s and type(sysinfo) == "table" and type(sysinfo.model) == "string" then
-        model = sysinfo.model
-      end
+  -- Read the kernel's hardware description directly if boot metadata is absent.
+  if not model then
+    model = model_name(read_file("/proc/device-tree/model"))
+      or model_name(read_file("/sys/firmware/devicetree/base/model"))
+  end
+
+  -- x86 systems usually expose their hardware identity through DMI instead.
+  if not model then
+    local product = model_name(read_file("/sys/devices/virtual/dmi/id/product_name"))
+    if product then
+      local vendor = model_name(read_file("/sys/devices/virtual/dmi/id/sys_vendor"))
+      model = vendor and not product:lower():find(vendor:lower(), 1, true)
+        and (vendor .. " " .. product) or product
     end
+  end
 
-    if model == "" then
-      model = "Unknown"
+  if not model and c then
+    local ok_s, sysinfo = pcall(c.call, c, "system", "info", {})
+    if ok_s and type(sysinfo) == "table" then
+      model = model_name(sysinfo.model)
     end
+  end
 
-    return { model = model }
-  end)
+  -- A board ID is less friendly, but still identifies the hardware accurately.
+  if not model then
+    model = model_name(board and board.board_name)
+      or model_name(board_model and board_model.id)
+      or model_name(read_file("/tmp/sysinfo/board_name"))
+  end
+
+  local device = { model = model or "Unknown" }
+  if model then
+    local entry = { ts = os_time(), data = device }
+    cache.device = entry
+    save_persistent_cache("device", entry)
+  else
+    clear_persistent_key("device")
+  end
+  return device
 end
 
 -- the client monitor package is optional and it moved its files around
@@ -1529,6 +1584,12 @@ function clear_cache()
   os.remove(PERSIST_FILE)
 end
 
+-- Service starts invalidate hardware identity without dropping other warm data.
+function clear_device_cache()
+  clear_persistent_key("device")
+  return read_persist_obj().device == nil
+end
+
 -- get all the numbers and return them
 -- the daemon calls this every 2s and the table is what the frontend gets.
 -- with fast set we leave out the slow stuff (isp lookup, vnstat) and
@@ -1647,6 +1708,7 @@ function collect(fast)
     client_monitor = client_monitor,
     network        = {
       status             = inet_status,
+      pending            = ping.pending == true,
       ping_rtt_ms        = ping.rtt_ms,
       public_ipv4        = netinfo.public_ipv4,
       public_ipv6        = netinfo.public_ipv6,

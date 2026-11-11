@@ -191,7 +191,7 @@ _do_update_check() {
 
 	# get the latest release from github, uclient-fetch is already on the
 	# router so no need for curl
-	local api_result latest_version="" download_url="" release_url="" release_body="" error_msg=""
+	local api_result latest_version="" release_url="" release_body="" error_msg=""
 	api_result=$(uclient-fetch -q -T 30 -O- --no-check-certificate "$GITHUB_API_URL" 2>/dev/null)
 
 	if [ -n "$api_result" ]; then
@@ -201,30 +201,6 @@ _do_update_check() {
 		fi
 		release_url=$(echo "$api_result" | jsonfilter -e '@.html_url' 2>/dev/null)
 		release_body=$(echo "$api_result" | jsonfilter -e '@.body' 2>/dev/null)
-
-		# look for the download url with the package type we want
-		local preferred_ext="ipk"
-		if [ -f /lib/apk/db/installed ]; then
-			preferred_ext="apk"
-		fi
-
-		local assets_count i
-		assets_count=$(echo "$api_result" | jsonfilter -e '@.assets[*].name' 2>/dev/null | wc -l)
-		i=0
-		while [ "$i" -lt "$assets_count" ]; do
-			local name url
-			name=$(echo "$api_result" | jsonfilter -e "@.assets[$i].name" 2>/dev/null)
-			url=$(echo "$api_result" | jsonfilter -e "@.assets[$i].browser_download_url" 2>/dev/null)
-			if [ -n "$name" ]; then
-				local ext
-				ext=$(echo "$name" | sed 's/.*\.//')
-				if [ "$ext" = "$preferred_ext" ] && ! echo "$name" | grep -q "i18n"; then
-					download_url="$url"
-					break
-				fi
-			fi
-			i=$((i + 1))
-		done
 	else
 		error_msg="Failed to fetch release info"
 	fi
@@ -273,7 +249,6 @@ _do_update_check() {
 	json_add_string "current_version" "$current_version"
 	json_add_string "latest_version" "${latest_version:-unknown}"
 	json_add_boolean "has_update" "$has_update"
-	json_add_string "download_url" "$download_url"
 	json_add_string "release_url" "$release_url"
 	json_add_string "release_body" "$release_body"
 	if [ -n "$error_msg" ]; then

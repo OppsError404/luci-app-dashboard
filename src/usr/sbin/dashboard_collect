@@ -22,6 +22,7 @@ local DATA_FILE       = "/tmp/dashboard/data.json"
 local HEARTBEAT_FILE  = "/tmp/dashboard/heartbeat"
 local PID_FILE        = "/tmp/dashboard/daemon.pid"
 local FORCE_FILE       = "/tmp/dashboard/.force_refresh"
+local DEVICE_REFRESH_FILE = "/tmp/dashboard/.device_refresh"
 local IDLE_TIMEOUT    = 60      -- stop after 60s without a client
 local COLLECT_INTERVAL = 2       -- collect every 2s
 local IDLE_CHECK_INTERVAL = 10   -- check the heartbeat every 10s when idle
@@ -71,6 +72,13 @@ local function file_exists(path)
   return true
 end
 
+local function refresh_device_cache()
+  if file_exists(DEVICE_REFRESH_FILE) and collector.clear_device_cache() then
+    os.remove(DEVICE_REFRESH_FILE)
+    log("device model cache cleared (service start)")
+  end
+end
+
 local function atomic_write(path, content)
   local tmp = path .. ".tmp." .. tostring(os.time()) .. "." .. tostring(math.random(100000, 999999)) .. "." .. tostring(os.clock() * 1000 % 1000000)
   local f = io.open(tmp, "w")
@@ -112,6 +120,8 @@ if not collector.init() then
   remove_pid()
   os.exit(1)
 end
+
+refresh_device_cache()
 
 -- first round without the slow stuff (ping, isp lookup, vnstat) so the
 -- file is there in about a second and the browser gets the cpu and wan
@@ -158,6 +168,7 @@ while true do
   prev_idle = idle
 
   -- the controller may ask us to drop the cache
+  refresh_device_cache()
   if file_exists(FORCE_FILE) then
     os.remove(FORCE_FILE)
     collector.clear_cache()

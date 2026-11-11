@@ -380,38 +380,16 @@
 
     /* update check */
     (function () {
-      function showUpdateToast() {
-        var existing = document.getElementById("update_toast");
-        if (existing) existing.remove();
-        var toast = document.createElement("div");
-        toast.id = "update_toast";
-        toast.className = "update_toast";
-        toast.innerHTML =
-          '<div class="update_toast_icon"><svg class="icon icon-copy"><use href="#icon-copy"/></svg></div>' +
-          '<div class="update_toast_body">' +
-          '<div class="update_toast_title">Install command copied</div>' +
-          '<div class="update_toast_msg">Paste it into your router\'s SSH console to upgrade.</div>' +
-          '</div>' +
-          '<button class="update_toast_close" type="button" aria-label="Dismiss">&times;</button>';
-        document.body.appendChild(toast);
-        var dismiss = function () {
-          toast.classList.remove("show");
-          setTimeout(function () { toast.remove(); }, 300);
-        };
-        toast.querySelector(".update_toast_close").addEventListener("click", dismiss);
-        requestAnimationFrame(function () { toast.classList.add("show"); });
-        setTimeout(dismiss, 4500);
-      }
       const elCurrentVer = document.getElementById("update_current_ver");
       const elLatestVer = document.getElementById("update_latest_ver");
       const elStatusText = document.getElementById("update_status_text");
       const elCheckBtn = document.getElementById("update_check_btn");
-      const elDownloadBtn = document.getElementById("update_download_btn");
       const elReleaseBtn = document.getElementById("update_release_btn");
-      const elCopyBtn = document.getElementById("update_copy_btn");
+      const elUpgradeNote = document.getElementById("update_upgrade_note");
       const settingsBtn = document.getElementById("settings_btn");
 
       function showError(msg) {
+        if (elUpgradeNote) elUpgradeNote.hidden = true;
         if (elStatusText) {
           elStatusText.textContent = msg;
           elStatusText.className = "csp_update_status_text error";
@@ -420,6 +398,7 @@
       }
 
       function doCheck(force) {
+        if (elUpgradeNote) elUpgradeNote.hidden = true;
         if (elCheckBtn) elCheckBtn.classList.add("busy");
         if (elStatusText) {
           elStatusText.textContent = "checking…";
@@ -453,6 +432,7 @@
                 return;
               }
 
+              if (elUpgradeNote) elUpgradeNote.hidden = !data.has_update;
               if (data.has_update) {
                 if (elStatusText) {
                   elStatusText.textContent =
@@ -460,17 +440,9 @@
                   elStatusText.className =
                     "csp_update_status_text update-available";
                 }
-                if (elDownloadBtn && data.download_url) {
-                  elDownloadBtn.href = data.download_url;
-                  elDownloadBtn.classList.remove("hidden");
-                }
                 if (elReleaseBtn && data.release_url) {
                   elReleaseBtn.href = data.release_url;
                   elReleaseBtn.classList.remove("hidden");
-                }
-                if (elCopyBtn && data.download_url) {
-                  elCopyBtn.dataset.url = data.download_url;
-                  elCopyBtn.classList.remove("hidden");
                 }
                 if (settingsBtn) settingsBtn.classList.add("has-warning");
               } else {
@@ -478,9 +450,7 @@
                   elStatusText.textContent = "Up to date";
                   elStatusText.className = "csp_update_status_text up-to-date";
                 }
-                if (elDownloadBtn) elDownloadBtn.classList.add("hidden");
                 if (elReleaseBtn) elReleaseBtn.classList.add("hidden");
-                if (elCopyBtn) elCopyBtn.classList.add("hidden");
                 if (settingsBtn) settingsBtn.classList.remove("has-warning");
               }
               if (elCheckBtn) elCheckBtn.classList.remove("busy");
@@ -500,54 +470,6 @@
 
       if (elCheckBtn) {
         elCheckBtn.addEventListener("click", () => doCheck(true));
-      }
-
-      if (elCopyBtn) {
-        elCopyBtn.addEventListener("click", function () {
-          var url = this.dataset.url || "";
-          if (!url) return;
-          var ext = url.split(".").pop();
-          var file = "/tmp/luci-app-dashboard." + ext;
-          var cmd;
-          if (ext === "apk") {
-            cmd =
-              "apk update && \\\n" +
-              'wget --no-check-certificate -O ' + file + ' "' + url + '" && \\\n' +
-              "apk add --allow-untrusted " + file + " && \\\n" +
-              "rm -f " + file;
-          } else {
-            cmd =
-              "opkg update && \\\n" +
-              'wget --no-check-certificate -O ' + file + ' "' + url + '" && \\\n' +
-              "opkg install " + file + " && \\\n" +
-              "rm -f " + file;
-          }
-          var self = this;
-          var done = function () {
-            self.classList.add("copied");
-            var orig = self.innerHTML;
-            self.innerHTML =
-              '<svg class="icon icon-copy"><use href="#icon-copy"/></svg> Copied';
-            setTimeout(function () {
-              self.classList.remove("copied");
-              self.innerHTML = orig;
-            }, 1500);
-            showUpdateToast();
-          };
-          var fallbackCopy = function () {
-            var ta = document.createElement("textarea");
-            ta.value = cmd;
-            document.body.appendChild(ta);
-            ta.select();
-            try { document.execCommand("copy"); done(); } catch (_) {}
-            document.body.removeChild(ta);
-          };
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(cmd).then(done).catch(fallbackCopy);
-          } else {
-            fallbackCopy();
-          }
-        });
       }
 
       // always check on page load, do not use the cached answer
@@ -730,7 +652,6 @@
         wifiCountsInterval: 20000,
         clientsUpdateInterval: 20000,
         vnstatUpdateInterval: 300000,
-        deviceUpdateInterval: 300000,
         memInterval: 20000,
       },
 
@@ -759,7 +680,6 @@
         clients: 0,
         vnstat: 0,
         mem: 0,
-        device: 0,
       },
       memSparkHistory: [],
       elements: {},
@@ -781,6 +701,7 @@
         catch (_) { return null; }
       })(),
       _hasWifi: null,
+      _lastDeviceModel: "",
 
       applyWifiModuleState(hasWifi) {
         const tile = document.getElementById("wifi_tile");
@@ -829,11 +750,17 @@
         const el = this.elements;
         if (!el.router_model_val) return;
         const model =
-          device && device.model != null
-            ? String(device.model).trim()
+          typeof device?.model === "string"
+            ? device.model.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim()
             : "";
-        el.router_model_val.textContent = model || "Unknown";
-        el.router_model_val.title = model || "";
+        if (model && !/^(?:unknown|n\/a|-{1,2}|not specified|default string|system product name|to be filled by o\.e\.m\.)$/i.test(model)) {
+          this._lastDeviceModel = model;
+        }
+        const display = this._lastDeviceModel || "Unknown";
+        if (el.router_model_val.textContent !== display) {
+          el.router_model_val.textContent = display;
+        }
+        el.router_model_val.title = this._lastDeviceModel || "";
       },
       lastVnstatData: null,
       _lastVnstatIfaceList: null,
@@ -939,7 +866,7 @@
             Number(cached.system_uptime_seconds),
           );
 
-        if (cached.network) this.applyNetworkFields(cached.network, true);
+        if (cached.network) this.applyNetworkFields(cached.network, true, cached.net?.iface);
 
         if (el.cpuTempBadge && cached.cpu_temp != null) {
           const t = Number(cached.cpu_temp) || 0;
@@ -1463,11 +1390,12 @@
         el.textContent = masked ? maskIpText(text) : text;
       },
 
-      applyNetworkFields(net, initial = false) {
+      applyNetworkFields(net, initial = false, wanIfName = "WAN") {
         if (!net || !this.elements.net_status) return;
         const el = this.elements;
         const status =
-          typeof net.status === "string" ? net.status.trim().toLowerCase() : "";
+          net.pending === true ? "pending" :
+            typeof net.status === "string" ? net.status.trim().toLowerCase() : "";
 
         const prevStatus = this._lastNetStatus || "";
         const statusChanged = prevStatus !== status;
@@ -1508,12 +1436,21 @@
           }
         } else {
           if (statusChanged) {
-            el.net_status.className = "badge";
-            el.net_status.innerHTML = "N/A";
+            el.net_status.className = status === "pending" ? "badge pending" : "badge";
+            el.net_status.textContent = status === "pending" ? "Checking…" : "N/A";
           }
         }
 
         this._lastNetStatus = status;
+
+        const wanDot = el.custom_lan_port_dots?.querySelector(".cl_port_dot_wan");
+        if (wanDot) {
+          const wanStatus = status === "online" || status === "up" ? "online" :
+            status === "offline" || status === "down" ? "offline" : "pending";
+          wanDot.className = "cl_port_dot_wan wan_" + wanStatus;
+          wanDot.title =
+            (wanIfName || "WAN") + " — " + (wanStatus === "pending" ? "checking" : wanStatus);
+        }
 
         const dot = el.net_status.querySelector(".status-dot");
         if (dot && !initial && statusChanged) {
@@ -1706,22 +1643,13 @@
               Number(data?.system_uptime_seconds ?? data?.system_uptime ?? 0),
             );
 
-          // the router model never changes, so it is only redrawn once in
-          // a while
-          if (
-            initial ||
-            now - (this.lastUpdate.device || 0) >=
-              this.config.deviceUpdateInterval
-          ) {
-            this.lastUpdate.device = now;
-            if (data?.device) this.renderDeviceWidget(data.device);
-          }
+          // A model missing from the first snapshot can arrive on the next poll.
+          this.renderDeviceWidget(data.device);
 
           // client monitor button and the wan chart width
           this.applyClientMonitorButton(data.client_monitor);
 
           if (data?.network) {
-            this.applyNetworkFields(data.network, initial);
             const net = data.network;
             const st = (net.status || "").toString().trim().toLowerCase();
             const pingMs =
@@ -2018,13 +1946,8 @@
                 return row;
               });
 
-              const wanOnline = data?.network?.status === "online";
-              const wanIfName = data?.net?.iface || "WAN";
               const wanDot = document.createElement("span");
-              wanDot.className =
-                "cl_port_dot_wan " + (wanOnline ? "wan_online" : "wan_offline");
-              wanDot.title =
-                wanIfName + " — " + (wanOnline ? "online" : "offline");
+              wanDot.className = "cl_port_dot_wan";
               wanDot.innerHTML = '<svg class="icon icon-globe"><use href="#icon-globe"/></svg>';
 
               const wanSep = document.createElement("span");
@@ -2062,6 +1985,12 @@
                 }
               });
             }
+          }
+
+          // Connectivity changes every poll, independently of the LAN list.
+          // Apply it after any port-strip rebuild so the new WAN dot is ready.
+          if (data?.network) {
+            pending.push(() => this.applyNetworkFields(data.network, initial, data.net?.iface));
           }
 
           const vn = data?.vnstat;

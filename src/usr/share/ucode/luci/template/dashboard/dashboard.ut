@@ -115,7 +115,7 @@ if (svg) print(svg);
               <div class="csp_title">Display</div>
               <label class="csp_row" role="menuitem">
                 <span class="csp_label"
-                  ><svg class="icon icon-chart-bar"><use href="#icon-chart-bar"/></svg> vnStat Card</span
+                  ><svg class="icon icon-chart-bar"><use href="#icon-chart-bar"/></svg> Usage Card</span
                 >
                 <span
                   class="csp_toggle"
@@ -169,7 +169,7 @@ if (svg) print(svg);
                 </a>
               </div>
               <div class="csp_sep"></div>
-              <div class="csp_title">Update</div>
+              <div class="csp_title">Upgrade</div>
               <div class="csp_update_wrap" id="update_check_wrap">
                 <div class="csp_update_row">
                   <span class="csp_label"
@@ -197,29 +197,27 @@ if (svg) print(svg);
                     <svg class="icon icon-sync-alt"><use href="#icon-sync-alt"/></svg> Check
                   </button>
                   <a
-                    class="csp_update_btn csp_update_btn_download hidden"
-                    id="update_download_btn"
-                    target="_blank"
-                    title="Download update package"
-                  >
-                    <svg class="icon icon-download"><use href="#icon-download"/></svg> Download
-                  </a>
-                  <a
                     class="csp_update_btn csp_update_btn_release hidden"
                     id="update_release_btn"
                     target="_blank"
-                    title="View release notes"
+                    title="View changelog"
                   >
-                    <svg class="icon icon-external-link-alt"><use href="#icon-external-link-alt"/></svg> Notes
+                    <svg class="icon icon-external-link-alt"><use href="#icon-external-link-alt"/></svg> Changelog
                   </a>
-                  <button
-                    class="csp_update_btn csp_update_btn_copy hidden"
-                    id="update_copy_btn"
-                    type="button"
-                    title="Copy install command"
+                  <a
+                    class="csp_update_btn csp_update_btn_upgrade"
+                    id="update_upgrade_btn"
+                    href="https://github.com/OppsError404/luci-app-dashboard"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    aria-describedby="update_upgrade_note"
+                    title="Open GitHub installation instructions"
                   >
-                    <svg class="icon icon-copy"><use href="#icon-copy"/></svg> Copy
-                  </button>
+                    <svg class="icon icon-external-link-alt"><use href="#icon-external-link-alt"/></svg> Upgrade link
+                  </a>
+                </div>
+                <div class="csp_update_note" id="update_upgrade_note" hidden>
+                  Use the installation link to upgrade
                 </div>
               </div>
             </div>

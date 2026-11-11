@@ -98,6 +98,10 @@ _decompress_assets() {
 # procd hooks
 
 start_service() {
+    # Keep the model across idle collector exits, but redetect on package start.
+    mkdir -p /tmp/dashboard && touch /tmp/dashboard/.device_refresh \
+        || log "WARN: failed to request device model refresh"
+
     auto_detect_multi_core
     /usr/sbin/dashboard_monitor _init
 
